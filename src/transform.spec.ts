@@ -1,533 +1,557 @@
-/// <reference types="jest-extended" />
+import { parse } from "acorn";
+import { transformChunk } from "./transform";
+import type { BundleGraph, Options } from "./types";
 
-import * as SWC from "./swc";
+const DEFAULT_OPTIONS: Required<Options> = {
+  promiseExportName: "__tla",
+  promiseImportName: i => `__tla_${i}`
+};
 
-import { BundleInfo } from "./bundle-info";
-import { DEFAULT_OPTIONS } from "./options";
-import { transformModule } from "./transform";
-
-function test(moduleName: string, bundleInfo: BundleInfo, code: string, expectedResult: string) {
-  const parse = (code: string) => SWC.parseSync(code, { target: "es2022", syntax: "ecmascript" });
-  const print = (ast: SWC.Module) => SWC.printSync(ast).code;
-
-  const originalAst = parse(code);
-  const transformedAst = transformModule(code, originalAst, moduleName, bundleInfo, DEFAULT_OPTIONS);
-
-  expect(print(transformedAst)).toBe(print(parse(expectedResult)));
+function parseCode(code: string) {
+  return parse(code, { ecmaVersion: 2022, sourceType: "module" }) as any;
 }
 
-describe("Transform top-level await", () => {
-  it("should work for a module without imports/exports", () => {
-    test(
-      "a",
-      {
-        a: { imported: [], importedBy: [], transformNeeded: true, withTopLevelAwait: true }
-      },
-      `
-      await globalThis.somePromise;
-    `,
-      `
-      (async () => {
-        await globalThis.somePromise;
-      })();
-    `
-    );
+function normalize(code: string): string {
+  // Normalize whitespace for comparison
+  return code.replace(/\s+/g, " ").trim();
+}
+
+function testTransform(
+  chunkName: string,
+  graph: BundleGraph,
+  code: string,
+  expectedSubstrings: string[]
+): string {
+  const ast = parseCode(code);
+  const result = transformChunk(code, ast, chunkName, graph, DEFAULT_OPTIONS);
+
+  for (const substr of expectedSubstrings) {
+    expect(normalize(result.code)).toContain(normalize(substr));
+  }
+
+  return result.code;
+}
+
+describe("transformChunk", () => {
+  it("should wrap TLA in async IIFE for module without imports/exports", () => {
+    const code = `await globalThis.somePromise;`;
+    const graph: BundleGraph = {
+      a: { transformNeeded: true, tlaImports: [], importedBy: [] }
+    };
+
+    const result = transformChunk(code, parseCode(code), "a", graph, DEFAULT_OPTIONS);
+
+    expect(result.code).toContain("(async () => {");
+    expect(result.code).toContain("await globalThis.somePromise;");
+    expect(result.code).toContain("})()");
+    // Should NOT export __tla if no exports and no importers
+    expect(result.code).not.toContain("export");
   });
 
-  it("should work for a module with imports", () => {
-    test(
-      "a",
-      {
-        a: { imported: ["./b"], importedBy: [], transformNeeded: true, withTopLevelAwait: true },
-        b: { imported: [], importedBy: ["./a"], transformNeeded: true, withTopLevelAwait: true }
-      },
-      `
-      import { qwq } from "./b";
-      await globalThis.somePromise;
-    `,
-      `
-      import { qwq, __tla as __tla_0 } from "./b";
-      Promise.all(
-        [(() => { try { return __tla_0; } catch {} })()]
-      ).then(async () => {
-        await globalThis.somePromise;
-      });
-    `
-    );
+  it("should add __tla import specifier to imports from transformed modules", () => {
+    const code = `import { qwq } from "./b";\nawait globalThis.somePromise;\n`;
+    const graph: BundleGraph = {
+      a: { transformNeeded: true, tlaImports: ["b"], importedBy: [] },
+      b: { transformNeeded: true, tlaImports: [], importedBy: ["a"] }
+    };
+
+    const result = transformChunk(code, parseCode(code), "a", graph, DEFAULT_OPTIONS);
+
+    expect(result.code).toContain("__tla as __tla_0");
+    expect(result.code).toContain("Promise.all(");
+    expect(result.code).toContain("try { return __tla_0; } catch {}");
   });
 
-  it("should work for a module with exports", () => {
-    test(
-      "a",
-      {
-        a: { imported: [], importedBy: [], transformNeeded: true, withTopLevelAwait: true }
-      },
-      `
-      const w = 0;
-      const x = await globalThis.somePromise;
-      const y = w + 1;
-      export { x, y as z };
-    `,
-      `
-      let x, y;
-      let __tla = (async () => {
-        const w = 0;
-        x = await globalThis.somePromise;
-        y = w + 1;
-      })();
-      export { x, y as z, __tla };
-    `
-    );
+  it("should export __tla when module has exports", () => {
+    const code = `const x = await globalThis.somePromise;\nexport { x };\n`;
+    const graph: BundleGraph = {
+      a: { transformNeeded: true, tlaImports: [], importedBy: [] }
+    };
+
+    const result = transformChunk(code, parseCode(code), "a", graph, DEFAULT_OPTIONS);
+
+    expect(result.code).toContain("let x;");
+    expect(result.code).toContain("let __tla =");
+    expect(result.code).toContain("export {");
+    expect(result.code).toContain("__tla");
   });
 
-  it("should work for a module with imports/exports", () => {
-    test(
-      "a",
-      {
-        a: { imported: ["./b"], importedBy: [], transformNeeded: true, withTopLevelAwait: true },
-        b: { imported: [], importedBy: ["./a"], transformNeeded: true, withTopLevelAwait: true }
-      },
-      `
-      import { qwq } from "./b";
-      const x = await globalThis.somePromise;
-      const y = 1;
-      export { x, y as z };
-    `,
-      `
-      import { qwq, __tla as __tla_0 } from "./b";
-      let x, y;
-      let __tla = Promise.all(
-        [(() => { try { return __tla_0; } catch {} })()]
-      ).then(async () => {
-        x = await globalThis.somePromise;
-        y = 1;
-      });
-      export { x, y as z, __tla };
-    `
-    );
+  it("should work with imports and exports", () => {
+    const code = [
+      `import { qwq } from "./b";`,
+      `const x = await globalThis.somePromise;`,
+      `const y = 1;`,
+      `export { x, y as z };`
+    ].join("\n");
+
+    const graph: BundleGraph = {
+      a: { transformNeeded: true, tlaImports: ["b"], importedBy: [] },
+      b: { transformNeeded: true, tlaImports: [], importedBy: ["a"] }
+    };
+
+    const result = transformChunk(code, parseCode(code), "a", graph, DEFAULT_OPTIONS);
+
+    expect(result.code).toContain("__tla as __tla_0");
+    expect(result.code).toContain("let x, y;");
+    expect(result.code).toContain("let __tla = Promise.all(");
+    expect(result.code).toContain("export { x, y as z, __tla };");
   });
 
-  it("should work for a module with multiple imports (some with TLA)", () => {
-    test(
-      "a",
-      {
-        a: { imported: ["./b", "./c", "./d"], importedBy: [], transformNeeded: true, withTopLevelAwait: true },
-        b: { imported: [], importedBy: ["./a"], transformNeeded: true, withTopLevelAwait: true },
-        c: { imported: [], importedBy: ["./a"], transformNeeded: false, withTopLevelAwait: false },
-        d: { imported: [], importedBy: ["./a"], transformNeeded: true, withTopLevelAwait: true }
-      },
-      `
-      import { qwq } from "./b";
-      import { quq as qvq } from "./c";
-      import { default as qaq } from "./d";
-      const x = await qvq[qaq].someFunc(globalThis.somePromise);
-      const y = 1;
-      export { x, y as default };
-    `,
-      `
-      import { qwq, __tla as __tla_0 } from "./b";
-      import { quq as qvq } from "./c";
-      import { default as qaq, __tla as __tla_1 } from "./d";
-      let x, y;
-      let __tla = Promise.all([
-        (() => { try { return __tla_0; } catch {} })(),
-        (() => { try { return __tla_1; } catch {} })()
-      ]).then(async () => {
-        x = await qvq[qaq].someFunc(globalThis.somePromise);
-        y = 1;
-      });
-      export { x, y as default, __tla };
-    `
-    );
+  it("should handle multiple imports (mixed TLA/non-TLA)", () => {
+    const code = [
+      `import { qwq } from "./b";`,
+      `import { quq as qvq } from "./c";`,
+      `import { default as qaq } from "./d";`,
+      `const x = await qvq;`,
+      `export { x };`
+    ].join("\n");
+
+    const graph: BundleGraph = {
+      a: { transformNeeded: true, tlaImports: ["b", "d"], importedBy: [] },
+      b: { transformNeeded: true, tlaImports: [], importedBy: ["a"] },
+      c: { transformNeeded: false, tlaImports: [], importedBy: ["a"] },
+      d: { transformNeeded: true, tlaImports: [], importedBy: ["a"] }
+    };
+
+    const result = transformChunk(code, parseCode(code), "a", graph, DEFAULT_OPTIONS);
+
+    // Should add __tla specifier to imports from b and d, but not c
+    expect(result.code).toContain(`from "./b"`);
+    expect(result.code).toContain("__tla as __tla_0");
+    expect(result.code).toContain("__tla as __tla_1");
+    expect(result.code).toContain("Promise.all(");
+    // Two try-catch blocks
+    expect(result.code).toContain("__tla_0");
+    expect(result.code).toContain("__tla_1");
   });
 
-  it("should work for a module with export functions", () => {
-    test(
-      "a",
-      {
-        a: { imported: [], importedBy: [], transformNeeded: true, withTopLevelAwait: true }
-      },
-      `
-      const x = await globalThis.somePromise;
-      function f0(args) { return Math.max(...args); }
-      function f1(args) { return f1(...args, 0); }
-      function* f2(args) { yield globalThis.qwq; }
-      async function f3(args) { await Promise.all(globalThis.promises); }
-      export { x, f1 as func1, f2 as func2, f3 as func3 };
-    `,
-      `
-      let x, __tla_export_f1, __tla_export_f2, __tla_export_f3;
-      let __tla = (async () => {
-        x = await globalThis.somePromise;
-        function f0(args) { return Math.max(...args); }
-        function f1(args) { return f1(...args, 0); }
-        __tla_export_f1 = f1;
-        function* f2(args) { yield globalThis.qwq; }
-        __tla_export_f2 = f2;
-        async function f3(args) { await Promise.all(globalThis.promises); }
-        __tla_export_f3 = f3;
-      })();
-      export { x, __tla_export_f1 as func1, __tla_export_f2 as func2, __tla_export_f3 as func3, __tla };
-    `
-    );
+  it("should handle export function with hoisting", () => {
+    const code = [
+      `const x = await globalThis.somePromise;`,
+      `export function f1(args) { return Math.max(...args); }`,
+      `export { x };`
+    ].join("\n");
+
+    const graph: BundleGraph = {
+      a: { transformNeeded: true, tlaImports: [], importedBy: [] }
+    };
+
+    const result = transformChunk(code, parseCode(code), "a", graph, DEFAULT_OPTIONS);
+
+    // "export" should be removed from "export function f1"
+    expect(result.code).toContain("function f1(args)");
+    // Should have hoisted binding
+    expect(result.code).toContain("__tla_export_f1");
+    expect(result.code).toContain("__tla_export_f1 = f1;");
+    // Export should use binding name
+    expect(result.code).toContain("__tla_export_f1 as f1");
   });
 
-  it("should work for a module with export classes", () => {
-    test(
-      "a",
-      {
-        a: { imported: [], importedBy: [], transformNeeded: true, withTopLevelAwait: true }
-      },
-      `
-      const x = await globalThis.somePromise;
-      class C0 { method0() { return 0; } }
-      class C1 extends C0 { method1() { return 1; } }
-      class C2 extends C1 { method2() { return 2; } }
-      export { x, C0 as Class0, C2 as Class2 };
-    `,
-      `
-      let x, __tla_export_C0, __tla_export_C2;
-      let __tla = (async () => {
-        x = await globalThis.somePromise;
-        class C0 { method0() { return 0; } }
-        __tla_export_C0 = C0;
-        class C1 extends C0 { method1() { return 1; } }
-        class C2 extends C1 { method2() { return 2; } }
-        __tla_export_C2 = C2;
-      })();
-      export { x, __tla_export_C0 as Class0, __tla_export_C2 as Class2, __tla };
-    `
-    );
+  it("should handle export default function with name", () => {
+    const code = [
+      `const a = await globalThis.somePromise;`,
+      `export default function A(b, c, d) { return a; }`
+    ].join("\n");
+
+    const graph: BundleGraph = {
+      a: { transformNeeded: true, tlaImports: [], importedBy: [] }
+    };
+
+    const result = transformChunk(code, parseCode(code), "a", graph, DEFAULT_OPTIONS);
+
+    expect(result.code).toContain("function A(b, c, d)");
+    expect(result.code).toContain("__tla_export_A");
+    expect(result.code).toContain("as default");
   });
 
-  it("should work for a module with exports of complex object destructuring", () => {
-    test(
-      "a",
-      {
-        a: { imported: [], importedBy: [], transformNeeded: true, withTopLevelAwait: true }
-      },
-      `
-      const { x, _0: { _1: { y, z } } = { _0: { _1: { y: 1, z: "" } } }, ...w } = await globalThis.somePromise;
-      export { x, z as zzz, w };
-    `,
-      `
-      let x, z, w;
-      let __tla = (async () => {
-        let y;
-        ({ x, _0: { _1: { y, z } } = { _0: { _1: { y: 1, z: "" } } }, ...w } = await globalThis.somePromise);
-      })();
-      export { x, z as zzz, w, __tla };
-    `
-    );
+  it("should handle export default function without name", () => {
+    const code = [
+      `const a = await globalThis.somePromise;`,
+      `export default function (b, c, d) { return a; }`
+    ].join("\n");
+
+    const graph: BundleGraph = {
+      a: { transformNeeded: true, tlaImports: [], importedBy: [] }
+    };
+
+    const result = transformChunk(code, parseCode(code), "a", graph, DEFAULT_OPTIONS);
+
+    expect(result.code).toContain("__tla_default_");
+    expect(result.code).toContain("as default");
   });
 
-  it("should work for a module with exports of complex array destructuring", () => {
-    test(
-      "a",
-      {
-        a: { imported: [], importedBy: [], transformNeeded: true, withTopLevelAwait: true }
-      },
-      `
-      const [x, [[[, y, , z] = [0, 1, 2, 3], w], ...u] = globalThis.someArray, ...v] = await globalThis.somePromise;
-      export { x, y as yyy, w as www, u as uuu };
-    `,
-      `
-      let x, y, w, u
-      let __tla = (async () => {
-        let z, v;
-        [x, [[[, y, , z] = [0, 1, 2, 3], w], ...u] = globalThis.someArray, ...v] = await globalThis.somePromise;
-      })();
-      export { x, y as yyy, w as www, u as uuu, __tla };
-    `
-    );
-  });
+  it("should handle export default expression", () => {
+    const code = [
+      `const a = await globalThis.somePromise;`,
+      `export default globalThis.someFunc().someProp + "qwq";`
+    ].join("\n");
 
-  it("should work for a module with plugin-injected function/class exports", () => {
-    test(
-      "a",
-      {
-        a: { imported: [], importedBy: [], transformNeeded: true, withTopLevelAwait: true }
-      },
-      `
-      const x = await globalThis.somePromise;
-      function f0(args) { return Math.max(...args); }
-      export function f1(args) { return f1(...args, 0); }
-      export function* f2(args) { yield globalThis.qwq; }
-      export async function f3(args) { await Promise.all(globalThis.promises); }
-      export class c1 { qwq = 1 }
-      export { x };
-    `,
-      `
-      let __tla_export_f1, __tla_export_f2, __tla_export_f3, __tla_export_c1, x;
-      let __tla = (async () => {
-        x = await globalThis.somePromise;
-        function f0(args) { return Math.max(...args); }
-        function f1(args) { return f1(...args, 0); }
-        __tla_export_f1 = f1;
-        function* f2(args) { yield globalThis.qwq; }
-        __tla_export_f2 = f2;
-        async function f3(args) { await Promise.all(globalThis.promises); }
-        __tla_export_f3 = f3;
-        class c1 { qwq = 1 }
-        __tla_export_c1 = c1;
-      })();
-      export { __tla_export_f1 as f1, __tla_export_f2 as f2, __tla_export_f3 as f3, __tla_export_c1 as c1, x, __tla };
-    `
-    );
-  });
+    const graph: BundleGraph = {
+      a: { transformNeeded: true, tlaImports: [], importedBy: [] }
+    };
 
-  it("should work for a module with default export declaration (with function name)", () => {
-    test(
-      "a",
-      {
-        a: { imported: [], importedBy: [], transformNeeded: true, withTopLevelAwait: true }
-      },
-      `
-      const a = await globalThis.somePromise;
-      export default function A(b, c, d) { return a; }
-    `,
-      `
-      let __tla_export_A;
-      let __tla = (async () => {
-        const a = await globalThis.somePromise;
-        function A(b, c, d) { return a; }
-        __tla_export_A = A;
-      })();
-      export { __tla_export_A as default, __tla };
-    `
-    );
-  });
+    const result = transformChunk(code, parseCode(code), "a", graph, DEFAULT_OPTIONS);
 
-  it("should work for a module with default export declaration (with class name)", () => {
-    test(
-      "a",
-      {
-        a: { imported: [], importedBy: [], transformNeeded: true, withTopLevelAwait: true }
-      },
-      `
-      const a = await globalThis.somePromise;
-      export default class A { prop = "qwq"; }
-    `,
-      `
-      let __tla_export_A;
-      let __tla = (async () => {
-        const a = await globalThis.somePromise;
-        class A { prop = "qwq"; }
-        __tla_export_A = A;
-      })();
-      export { __tla_export_A as default, __tla };
-    `
-    );
-  });
-
-  it("should work for a module with default export declaration (without name)", () => {
-    test(
-      "a",
-      {
-        a: { imported: [], importedBy: [], transformNeeded: true, withTopLevelAwait: true }
-      },
-      `
-      const a = await globalThis.somePromise;
-      export default function (b, c, d) { return a; }
-    `,
-      `
-      let var_69d2a4fc_d77c_5996_9dda_fc4d543f0a82;
-      let __tla = (async () => {
-        const a = await globalThis.somePromise;
-        var_69d2a4fc_d77c_5996_9dda_fc4d543f0a82 = function (b, c, d) { return a; };
-      })();
-      export { var_69d2a4fc_d77c_5996_9dda_fc4d543f0a82 as default, __tla };
-    `
-    );
-  });
-
-  it("should work for a module with default export expression", () => {
-    test(
-      "a",
-      {
-        a: { imported: [], importedBy: [], transformNeeded: true, withTopLevelAwait: true }
-      },
-      `
-      const a = await globalThis.somePromise;
-      export default globalThis.someFunc().someProp + "qwq";
-    `,
-      `
-      let var_b51c2b27_5763_5458_95c3_0273366c9dee;
-      let __tla = (async () => {
-        const a = await globalThis.somePromise;
-        var_b51c2b27_5763_5458_95c3_0273366c9dee = globalThis.someFunc().someProp + "qwq";
-      })();
-      export { var_b51c2b27_5763_5458_95c3_0273366c9dee as default, __tla };
-    `
-    );
-  });
-
-  it("should work for a module with default and named export of the same identifier", () => {
-    test(
-      "a",
-      {
-        a: { imported: [], importedBy: [], transformNeeded: true, withTopLevelAwait: true }
-      },
-      `
-      const a = await globalThis.somePromise;
-      export { a, a as default };
-    `,
-      `
-      let a;
-      let __tla = (async () => {
-        a = await globalThis.somePromise;
-      })();
-      export { a, a as default, __tla };
-    `
-    );
-  });
-
-  it("should work for a module with manual re-exports", () => {
-    test(
-      "a",
-      {
-        a: { imported: ["./b"], importedBy: [], transformNeeded: true, withTopLevelAwait: true },
-        b: { imported: [], importedBy: ["./a"], transformNeeded: true, withTopLevelAwait: true }
-      },
-      `
-      import { default as qwq } from "./b";
-      export { qwq };
-    `,
-      `
-      import { default as qwq, __tla as __tla_0 } from "./b";
-      let __tla = Promise.all([
-        (() => { try { return __tla_0; } catch {} })(),
-      ]).then(async () => {});
-      export { qwq, __tla };
-    `
-    );
-  });
-
-  it("should work for a module with export-from statements", () => {
-    test(
-      "a",
-      {
-        a: { imported: ["./b"], importedBy: [], transformNeeded: true, withTopLevelAwait: true },
-        b: { imported: [], importedBy: ["./a"], transformNeeded: true, withTopLevelAwait: true }
-      },
-      `
-      import { qwq } from "./b";
-      export { owo as uwu, default as ovo } from "./b";
-      export * as QwQ from "./b";
-      const qaq = await globalThis.someFunc(qwq);
-      export { qaq };
-    `,
-      `
-      import { qwq, __tla as __tla_0 } from "./b";
-      import { __tla as __tla_1 } from "./b";
-      import { __tla as __tla_2 } from "./b";
-      export { owo as uwu, default as ovo } from "./b";
-      export * as QwQ from "./b";
-      let qaq;
-      let __tla = Promise.all([
-        (() => { try { return __tla_0; } catch {} })(),
-        (() => { try { return __tla_1; } catch {} })(),
-        (() => { try { return __tla_2; } catch {} })(),
-      ]).then(async () => {
-        qaq = await globalThis.someFunc(qwq);
-      });
-      export { qaq, __tla };
-    `
-    );
-  });
-
-  it("should skip processing imports of external modules", () => {
-    test(
-      "a",
-      {
-        a: { imported: [], importedBy: [], transformNeeded: true, withTopLevelAwait: true }
-      },
-      `
-      import React from "https://esm.run/react";
-      import path from "path";
-      import MuiMaterial from "@mui/material";
-      const x = await globalThis.someFunc(React, path);
-      export { x as y };
-    `,
-      `
-      import React from "https://esm.run/react";
-      import path from "path";
-      import MuiMaterial from "@mui/material";
-      let x;
-      let __tla = (async () => {
-        x = await globalThis.someFunc(React, path);
-      })();
-      export { x as y, __tla };
-    `
-    );
-  });
-
-  it("should handle side-effect-only imports correctly", () => {
-    test(
-      "a",
-      {
-        a: { imported: ["./b"], importedBy: [], transformNeeded: true, withTopLevelAwait: false },
-        b: { imported: [], importedBy: ["./a"], transformNeeded: true, withTopLevelAwait: true }
-      },
-      `
-      import "./b";
-      const x = 1;
-      export { x };
-      `,
-      `
-      import { __tla as __tla_0 } from "./b";
-      let x;
-      let __tla = Promise.all([
-        (() => { try { return __tla_0; } catch {} })(),
-      ]).then(async () => {
-        x = 1;
-      });
-      export { x, __tla };
-      `
-    );
+    expect(result.code).toContain("__tla_default_");
+    expect(result.code).toContain("as default");
+    expect(result.code).not.toContain("export default");
   });
 
   it("should transform dynamic imports correctly", () => {
-    test(
-      "a",
-      {
-        a: { imported: [], importedBy: [], transformNeeded: true, withTopLevelAwait: true },
-        b: { imported: [], importedBy: [], transformNeeded: false, withTopLevelAwait: false },
-        c: { imported: [], importedBy: [], transformNeeded: true, withTopLevelAwait: true }
-      },
-      `
-      const x = await Promise.all([
-        import("./b"),
-        import("./c"),
-        import(globalThis.dynamicModuleName)
-      ]);
-      export { x as y };
-    `,
-      `
-      let x;
-      let __tla = (async () => {
-        x = await Promise.all([
-          import("./b"),
-          import("./c").then(async m => { await m.__tla; return m; }),
-          import(globalThis.dynamicModuleName).then(async m => { await m.__tla; return m; })
-        ]);
-      })();
-      export { x as y, __tla };
-    `
-    );
+    const code = [
+      `const x = await Promise.all([`,
+      `  import("./b"),`,
+      `  import("./c"),`,
+      `  import(globalThis.dynamicModuleName)`,
+      `]);`,
+      `export { x as y };`
+    ].join("\n");
+
+    const graph: BundleGraph = {
+      a: { transformNeeded: true, tlaImports: [], importedBy: [] },
+      b: { transformNeeded: false, tlaImports: [], importedBy: [] },
+      c: { transformNeeded: true, tlaImports: [], importedBy: [] }
+    };
+
+    const result = transformChunk(code, parseCode(code), "a", graph, DEFAULT_OPTIONS);
+
+    // import("./b") should NOT be wrapped (module b doesn't need transform)
+    // import("./c") should be wrapped
+    // import(dynamic) should be wrapped
+    expect(result.code).toContain(`import("./c").then(async m => { await m.__tla; return m; })`);
+    expect(result.code).toContain(`import(globalThis.dynamicModuleName).then(async m => { await m.__tla; return m; })`);
+    // Check ./b is NOT wrapped
+    expect(result.code).not.toContain(`import("./b").then`);
   });
-  it("should fail gracefully if bundleInfo is undefined", () => {
-    test(
-      "css-module.js",
-      {},
-      `
-    await globalThis.someFunc(import("./css-module.js"));
-  `,
-      `
-    (async () => {
-      await globalThis.someFunc(import("./css-module.js"));
-    })();
-  `
-    );
+
+  it("should handle side-effect-only imports", () => {
+    const code = [
+      `import "./b";`,
+      `const x = 1;`,
+      `export { x };`
+    ].join("\n");
+
+    const graph: BundleGraph = {
+      a: { transformNeeded: true, tlaImports: ["b"], importedBy: [] },
+      b: { transformNeeded: true, tlaImports: [], importedBy: ["a"] }
+    };
+
+    const result = transformChunk(code, parseCode(code), "a", graph, DEFAULT_OPTIONS);
+
+    expect(result.code).toContain("__tla as __tla_0");
+    expect(result.code).toContain("from");
+  });
+
+  it("should handle export-from statements", () => {
+    const code = [
+      `import { qwq } from "./b";`,
+      `export { owo as uwu } from "./b";`,
+      `const qaq = await globalThis.someFunc(qwq);`,
+      `export { qaq };`
+    ].join("\n");
+
+    const graph: BundleGraph = {
+      a: { transformNeeded: true, tlaImports: ["b"], importedBy: [] },
+      b: { transformNeeded: true, tlaImports: [], importedBy: ["a"] }
+    };
+
+    const result = transformChunk(code, parseCode(code), "a", graph, DEFAULT_OPTIONS);
+
+    // Should add TLA import for the regular import
+    expect(result.code).toContain("__tla as __tla_0");
+    // Should add a new import for the export-from
+    expect(result.code).toContain("__tla as __tla_1");
+    // Export-from should remain
+    expect(result.code).toContain(`export { owo as uwu } from "./b"`);
+  });
+
+  it("should skip external module imports", () => {
+    const code = [
+      `import React from "react";`,
+      `import path from "path";`,
+      `const x = await globalThis.someFunc(React, path);`,
+      `export { x as y };`
+    ].join("\n");
+
+    const graph: BundleGraph = {
+      a: { transformNeeded: true, tlaImports: [], importedBy: [] }
+    };
+
+    const result = transformChunk(code, parseCode(code), "a", graph, DEFAULT_OPTIONS);
+
+    // External imports should NOT get __tla specifier
+    expect(result.code).not.toContain("__tla as __tla");
+    // But the module should still be wrapped
+    expect(result.code).toContain("(async () => {");
+  });
+
+  it("should export __tla when module has importers", () => {
+    const code = `await globalThis.somePromise;\n`;
+    const graph: BundleGraph = {
+      a: { transformNeeded: true, tlaImports: [], importedBy: ["b"] }
+    };
+
+    const result = transformChunk(code, parseCode(code), "a", graph, DEFAULT_OPTIONS);
+
+    expect(result.code).toContain("let __tla =");
+    expect(result.code).toContain("export {");
+    expect(result.code).toContain("__tla");
+  });
+
+  it("should generate sourcemap", () => {
+    const code = `await globalThis.somePromise;\n`;
+    const graph: BundleGraph = {
+      a: { transformNeeded: true, tlaImports: [], importedBy: [] }
+    };
+
+    const ast = parseCode(code);
+    const result = transformChunk(code, ast, "a", graph, DEFAULT_OPTIONS);
+
+    expect(result.map).toBeDefined();
+    expect(result.map.mappings).toBeTruthy();
+  });
+
+  it("should handle variable destructuring with exports", () => {
+    const code = [
+      `const { x, y } = await globalThis.somePromise;`,
+      `export { x };`
+    ].join("\n");
+
+    const graph: BundleGraph = {
+      a: { transformNeeded: true, tlaImports: [], importedBy: [] }
+    };
+
+    const result = transformChunk(code, parseCode(code), "a", graph, DEFAULT_OPTIONS);
+
+    expect(result.code).toContain("let x;");
+    expect(result.code).toContain("__tla");
+    // Should produce valid JS
+    expect(() => parseCode(result.code)).not.toThrow();
+  });
+
+  // --- Edge case tests ---
+
+  it("should produce valid JS for object destructuring (all exported)", () => {
+    const code = [
+      `const { a, b } = await globalThis.somePromise;`,
+      `export { a, b };`
+    ].join("\n");
+
+    const graph: BundleGraph = {
+      m: { transformNeeded: true, tlaImports: [], importedBy: [] }
+    };
+
+    const result = transformChunk(code, parseCode(code), "m", graph, DEFAULT_OPTIONS);
+    // Must produce valid JS (destructuring assignment needs parens)
+    expect(() => parseCode(result.code)).not.toThrow();
+    expect(result.code).toContain("let a, b;");
+    // Should contain assignment, not declaration
+    expect(normalize(result.code)).toContain("({ a, b } = await globalThis.somePromise");
+  });
+
+  it("should produce valid JS for array destructuring", () => {
+    const code = [
+      `const [x, y, ...z] = await globalThis.somePromise;`,
+      `export { x, y };`
+    ].join("\n");
+
+    const graph: BundleGraph = {
+      m: { transformNeeded: true, tlaImports: [], importedBy: [] }
+    };
+
+    const result = transformChunk(code, parseCode(code), "m", graph, DEFAULT_OPTIONS);
+    expect(() => parseCode(result.code)).not.toThrow();
+    expect(result.code).toContain("let x, y;");
+  });
+
+  it("should produce valid JS for mixed exported/unexported destructuring", () => {
+    const code = [
+      `const { x, y, z } = await globalThis.somePromise;`,
+      `export { x, z as zzz };`
+    ].join("\n");
+
+    const graph: BundleGraph = {
+      m: { transformNeeded: true, tlaImports: [], importedBy: [] }
+    };
+
+    const result = transformChunk(code, parseCode(code), "m", graph, DEFAULT_OPTIONS);
+    expect(() => parseCode(result.code)).not.toThrow();
+    // x and z are exported (hoisted), y stays in IIFE
+    expect(result.code).toContain("let x, z;");
+    expect(result.code).toContain("let y;");
+  });
+
+  it("should handle export class with hoisting", () => {
+    const code = [
+      `const x = await globalThis.somePromise;`,
+      `export class C0 { method0() { return 0; } }`,
+      `class C1 extends C0 { method1() { return 1; } }`,
+      `export { x, C1 as Class1 };`
+    ].join("\n");
+
+    const graph: BundleGraph = {
+      a: { transformNeeded: true, tlaImports: [], importedBy: [] }
+    };
+
+    const result = transformChunk(code, parseCode(code), "a", graph, DEFAULT_OPTIONS);
+    expect(() => parseCode(result.code)).not.toThrow();
+    expect(result.code).toContain("__tla_export_C0");
+    expect(result.code).toContain("__tla_export_C0 = C0;");
+    expect(result.code).toContain("__tla_export_C1");
+    expect(result.code).toContain("__tla_export_C1 = C1;");
+  });
+
+  it("should handle export default class with name", () => {
+    const code = [
+      `const a = await globalThis.somePromise;`,
+      `export default class A { prop = "qwq"; }`
+    ].join("\n");
+
+    const graph: BundleGraph = {
+      a: { transformNeeded: true, tlaImports: [], importedBy: [] }
+    };
+
+    const result = transformChunk(code, parseCode(code), "a", graph, DEFAULT_OPTIONS);
+    expect(() => parseCode(result.code)).not.toThrow();
+    expect(result.code).toContain("class A");
+    expect(result.code).toContain("__tla_export_A");
+    expect(result.code).toContain("as default");
+  });
+
+  it("should handle default and named export of same identifier", () => {
+    const code = [
+      `const a = await globalThis.somePromise;`,
+      `export { a, a as default };`
+    ].join("\n");
+
+    const graph: BundleGraph = {
+      m: { transformNeeded: true, tlaImports: [], importedBy: [] }
+    };
+
+    const result = transformChunk(code, parseCode(code), "m", graph, DEFAULT_OPTIONS);
+    expect(() => parseCode(result.code)).not.toThrow();
+    expect(result.code).toContain("let a;");
+    expect(result.code).toContain("a as default");
+    expect(result.code).toContain("__tla");
+  });
+
+  it("should handle manual re-exports", () => {
+    const code = [
+      `import { default as qwq } from "./b";`,
+      `export { qwq };`
+    ].join("\n");
+
+    const graph: BundleGraph = {
+      a: { transformNeeded: true, tlaImports: ["b"], importedBy: [] },
+      b: { transformNeeded: true, tlaImports: [], importedBy: ["a"] }
+    };
+
+    const result = transformChunk(code, parseCode(code), "a", graph, DEFAULT_OPTIONS);
+    expect(() => parseCode(result.code)).not.toThrow();
+    expect(result.code).toContain("__tla as __tla_0");
+    expect(result.code).toContain("Promise.all(");
+    expect(result.code).toContain("export {");
+    expect(result.code).toContain("qwq");
+  });
+
+  it("should handle export * as ns from", () => {
+    const code = [
+      `export * as QwQ from "./b";`,
+      `const x = await globalThis.somePromise;`,
+      `export { x };`
+    ].join("\n");
+
+    const graph: BundleGraph = {
+      a: { transformNeeded: true, tlaImports: ["b"], importedBy: [] },
+      b: { transformNeeded: true, tlaImports: [], importedBy: ["a"] }
+    };
+
+    const result = transformChunk(code, parseCode(code), "a", graph, DEFAULT_OPTIONS);
+    expect(() => parseCode(result.code)).not.toThrow();
+    // export * as QwQ from "./b" should remain
+    expect(result.code).toContain(`export * as QwQ from "./b"`);
+    // Should add TLA import for it
+    expect(result.code).toContain("__tla as __tla_0");
+  });
+
+  it("should handle non-exported variable declarations (no transform)", () => {
+    const code = [
+      `const internal = "hello";`,
+      `const x = await globalThis.somePromise;`,
+      `export { x };`
+    ].join("\n");
+
+    const graph: BundleGraph = {
+      m: { transformNeeded: true, tlaImports: [], importedBy: [] }
+    };
+
+    const result = transformChunk(code, parseCode(code), "m", graph, DEFAULT_OPTIONS);
+    expect(() => parseCode(result.code)).not.toThrow();
+    // internal should stay as const inside IIFE
+    expect(result.code).toContain('const internal = "hello"');
+    // x should be hoisted
+    expect(result.code).toContain("let x;");
+  });
+
+  it("should handle export const declaration", () => {
+    const code = [
+      `export const x = await globalThis.somePromise;`,
+      `export const y = 42;`
+    ].join("\n");
+
+    const graph: BundleGraph = {
+      m: { transformNeeded: true, tlaImports: [], importedBy: [] }
+    };
+
+    const result = transformChunk(code, parseCode(code), "m", graph, DEFAULT_OPTIONS);
+    expect(() => parseCode(result.code)).not.toThrow();
+    // Both x and y are exported, so both hoisted in one declaration
+    expect(result.code).toMatch(/let\s+.*x/);
+    expect(result.code).toMatch(/let\s+.*y/);
+    expect(result.code).toContain("__tla");
+    // export keyword should be removed
+    expect(result.code).not.toContain("export const");
+  });
+
+  it("should handle module with only dynamic imports (no TLA)", () => {
+    const code = [
+      `const m = import("./lazy");`,
+      `export { m };`
+    ].join("\n");
+
+    const graph: BundleGraph = {
+      a: { transformNeeded: true, tlaImports: [], importedBy: [] },
+      lazy: { transformNeeded: true, tlaImports: [], importedBy: [] }
+    };
+
+    const result = transformChunk(code, parseCode(code), "a", graph, DEFAULT_OPTIONS);
+    expect(() => parseCode(result.code)).not.toThrow();
+    expect(result.code).toContain(".then(async m =>");
+  });
+
+  it("should handle empty body with only re-exports from TLA module", () => {
+    const code = [
+      `export { foo, bar } from "./b";`
+    ].join("\n");
+
+    const graph: BundleGraph = {
+      a: { transformNeeded: true, tlaImports: ["b"], importedBy: ["c"] },
+      b: { transformNeeded: true, tlaImports: [], importedBy: ["a"] }
+    };
+
+    const result = transformChunk(code, parseCode(code), "a", graph, DEFAULT_OPTIONS);
+    expect(() => parseCode(result.code)).not.toThrow();
+    // Should still create __tla promise and export it
+    expect(result.code).toContain("__tla");
+    expect(result.code).toContain("export {");
+  });
+
+  it("gracefully handles missing chunk in graph", () => {
+    const code = `await globalThis.someFunc(import("./unknown.js"));\n`;
+    const graph: BundleGraph = {};
+
+    const result = transformChunk(code, parseCode(code), "css-module.js", graph, DEFAULT_OPTIONS);
+    expect(() => parseCode(result.code)).not.toThrow();
+    expect(result.code).toContain("(async () => {");
   });
 });

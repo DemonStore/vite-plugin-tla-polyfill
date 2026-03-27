@@ -1,432 +1,393 @@
-import * as SWC from "./swc";
-
-import { BundleInfo } from "./bundle-info";
-import { Options } from "./options";
-import { raiseUnexpectedNode } from "./utils/error";
-import {
-  makeIdentifier,
-  makeAssignmentStatement,
-  makeVariablesDeclaration,
-  makeImportSpecifier,
-  makeArrayExpression,
-  makeCallExpression,
-  makeArrowFunction,
-  makeTryCatchStatement,
-  makeReturnStatement,
-  makeMemberExpression,
-  makeVariableInitDeclaration,
-  makeExportListDeclaration,
-  makeStatement,
-  makeAwaitExpression,
-  makeImportDeclaration
-} from "./utils/make-node";
-import { RandomIdentifierGenerator } from "./utils/random-identifier";
+import type {
+  Program,
+  ImportDeclaration,
+  ExportNamedDeclaration,
+  ExportDefaultDeclaration,
+  ExportAllDeclaration,
+  VariableDeclaration,
+  FunctionDeclaration,
+  ClassDeclaration,
+  Statement,
+  ModuleDeclaration,
+  Pattern,
+  Node
+} from "estree";
+import MagicString from "magic-string";
+import type { BundleGraph, Options } from "./types";
 import { resolveImport } from "./utils/resolve-import";
-import { resolvePattern } from "./utils/resolve-pattern";
 
-function transformByType(node: object, type: string, filter: (node: SWC.Node) => SWC.Node) {
-  for (const key of Array.isArray(node) ? node.keys() : Object.keys(node)) {
-    if (["span", "type"].includes(key as string)) continue;
-    if (!node[key]) continue;
-    if (typeof node[key] === "object") node[key] = transformByType(node[key], type, filter);
-  }
-
-  if (node["type"] === type) return filter(node as SWC.Node);
-  return node;
+interface TransformResult {
+  code: string;
+  map: ReturnType<MagicString["generateMap"]>;
 }
 
-function declarationToExpression(
-  decl: SWC.FunctionDeclaration | SWC.ClassDeclaration
-): SWC.FunctionExpression | SWC.ClassExpression {
-  if (decl.type === "FunctionDeclaration") {
-    return <SWC.FunctionExpression>{
-      ...decl,
-      identifier: null,
-      type: "FunctionExpression"
-    };
-  } else if (decl.type === "ClassDeclaration") {
-    return <SWC.ClassExpression>{
-      ...decl,
-      identifier: null,
-      type: "ClassExpression"
-    };
-  } else {
-    /* istanbul ignore next */
-    raiseUnexpectedNode("declaration", (decl as SWC.Node).type);
-  }
-}
-
-function expressionToDeclaration(
-  expr: SWC.FunctionExpression | SWC.ClassExpression
-): SWC.FunctionDeclaration | SWC.ClassDeclaration {
-  if (expr.type === "FunctionExpression") {
-    return <SWC.FunctionDeclaration>{
-      ...expr,
-      type: "FunctionDeclaration"
-    };
-  } else if (expr.type === "ClassExpression") {
-    return <SWC.ClassDeclaration>{
-      ...expr,
-      type: "ClassDeclaration"
-    };
-  } else {
-    /* istanbul ignore next */
-    raiseUnexpectedNode("expression", (expr as SWC.Node).type);
-  }
-}
-
-export function transformModule(
+export function transformChunk(
   code: string,
-  ast: SWC.Module,
-  moduleName: string,
-  bundleInfo: BundleInfo,
-  options: Options
-) {
-  const randomIdentifier = new RandomIdentifierGenerator(code);
+  ast: Program,
+  chunkName: string,
+  graph: BundleGraph,
+  options: Required<Options>
+): TransformResult {
+  const s = new MagicString(code);
 
-  // Extract import declarations
-  const imports = ast.body.filter((item): item is SWC.ImportDeclaration => item.type === "ImportDeclaration");
+  // --- Phase 1: Classify statements and process export declarations ---
+  const imports: ImportDeclaration[] = [];
+  const exportFroms: (ExportNamedDeclaration | ExportAllDeclaration)[] = [];
+  const namedExports: ExportNamedDeclaration[] = []; // export { x, y } without source
+  const bodyStmts: { node: Statement | ModuleDeclaration; start: number; end: number }[] = [];
 
-  // Handle `export { named as renamed } from "module";`
-  const exportFroms = ast.body.filter(
-    (item): item is SWC.ExportNamedDeclaration => item.type === "ExportNamedDeclaration" && !!item.source
-  );
-  const newImportsByExportFroms: SWC.ImportDeclaration[] = [];
+  const exportMap: Record<string, string> = {}; // exportedName -> localName
+  const hoistedExportNames = new Set<string>(); // function/class names that need hoisting
 
-  const exportMap: Record<string, string> = {};
+  let defaultCounter = 0;
 
-  // Extract export declarations
-  // In Rollup's output, there should be only one, and as the last top-level statement
-  // But some plugins (e.g. @vitejs/plugin-legacy) may inject others like "export function"
-  const namedExports = ast.body.filter((item, i): item is SWC.ExportNamedDeclaration => {
-    switch (item.type) {
-      /* istanbul ignore next */
+  for (const stmt of ast.body) {
+    const start = stmt.start!;
+    const end = stmt.end!;
+
+    switch (stmt.type) {
+      case "ImportDeclaration":
+        imports.push(stmt);
+        break;
+
       case "ExportAllDeclaration":
-        raiseUnexpectedNode("top-level statement", item.type);
-      case "ExportDefaultExpression":
-        // Convert to a variable
-        const identifier = randomIdentifier.generate();
-        ast.body[i] = makeVariableInitDeclaration(identifier, item.expression);
-        exportMap["default"] = identifier;
-        return false;
-      case "ExportDefaultDeclaration":
-        if (item.decl.type === "FunctionExpression" || item.decl.type === "ClassExpression") {
-          // Convert to a declaration or variable
-          if (item.decl.identifier) {
-            ast.body[i] = expressionToDeclaration(item.decl);
-            exportMap["default"] = item.decl.identifier.value;
-          } else {
-            const identifier = randomIdentifier.generate();
-            ast.body[i] = makeVariableInitDeclaration(identifier, item.decl);
-            exportMap["default"] = identifier;
+        exportFroms.push(stmt);
+        break;
+
+      case "ExportNamedDeclaration":
+        if (stmt.source) {
+          exportFroms.push(stmt);
+        } else if (stmt.declaration) {
+          const decl = stmt.declaration;
+          if (decl.type === "FunctionDeclaration" || decl.type === "ClassDeclaration") {
+            const name = decl.id!.name;
+            exportMap[name] = name;
+            hoistedExportNames.add(name);
+            // Remove "export " keyword, keep the declaration
+            s.remove(start, decl.start!);
+            bodyStmts.push({ node: decl, start: decl.start!, end });
+          } else if (decl.type === "VariableDeclaration") {
+            // export const x = ...; — remove "export ", treat as body
+            s.remove(start, decl.start!);
+            // Add names to export map
+            for (const d of decl.declarations) {
+              for (const name of resolvePatternNames(d.id)) {
+                exportMap[name] = name;
+              }
+            }
+            bodyStmts.push({ node: decl, start: decl.start!, end });
           }
         } else {
-          /* istanbul ignore next */
-          raiseUnexpectedNode("top-level export declaration", item.decl.type);
-        }
-
-        return false;
-      case "ExportDeclaration":
-        if (item.declaration.type === "FunctionDeclaration" || item.declaration.type === "ClassDeclaration") {
-          // Remove the "export" keyword from this statement
-          ast.body[i] = item.declaration;
-          exportMap[item.declaration.identifier.value] = item.declaration.identifier.value;
-        } else {
-          /* istanbul ignore next */
-          raiseUnexpectedNode("top-level export declaration", item.declaration.type);
-        }
-
-        return false;
-      // Handle `export { named as renamed };` without "from"
-      case "ExportNamedDeclaration":
-        if (!item.source) {
-          item.specifiers.forEach(specifier => {
-            /* istanbul ignore if */
-            if (specifier.type !== "ExportSpecifier") {
-              raiseUnexpectedNode("export specifier", specifier.type);
+          // export { x, y as z }
+          for (const spec of stmt.specifiers) {
+            if (spec.type === "ExportSpecifier") {
+              const exported = spec.exported;
+              const exportedName = exported.type === "Identifier"
+                ? exported.name : String((exported as any).value);
+              const localName = spec.local.type === "Identifier"
+                ? spec.local.name : String((spec.local as any).value);
+              exportMap[exportedName] = localName;
             }
-
-            exportMap[(specifier.exported || specifier.orig).value] = specifier.orig.value;
-          });
+          }
+          namedExports.push(stmt);
         }
+        break;
 
-        return true;
-    }
-
-    return false;
-  });
-
-  const exportedNameSet = new Set(Object.values(exportMap));
-  const exportedNames = Array.from(exportedNameSet);
-
-  /*
-   * Move ALL top-level statements to an async IIFE:
-   *
-   * ```js
-   * export let __tla = Promise.all([
-   *   // imported TLA promises
-   * ]).then(async () => {
-   *   // original top-level statements here
-   * });
-   * ```
-   *
-   * And add variable declarations for exported names to new top-level, before the IIFE.
-   *
-   * ```js
-   * let x;
-   * export let __tla = Promise.all([
-   *   // imported TLA promises
-   * ]).then(async () => {
-   *   // const x = 1;
-   *   x = 1;
-   * });
-   * export { x as someExport };
-   * ```
-   */
-
-  const topLevelStatements = ast.body.filter(
-    (item): item is SWC.Statement =>
-      !(imports as SWC.ModuleItem[]).includes(item) && !(namedExports as SWC.ModuleItem[]).includes(item)
-  );
-
-  // Preserve function/class hoisting for exported declarations.
-  // When these declarations are rewritten to assignments, code that relies on hoisting breaks.
-  // Use dedicated export binding names and keep declaration statements untouched.
-  const hoistedExportNames = new Set(
-    topLevelStatements.flatMap(statement => {
-      if (
-        (statement.type === "FunctionDeclaration" || statement.type === "ClassDeclaration") &&
-        exportedNameSet.has(statement.identifier.value)
-      ) {
-        return [statement.identifier.value];
-      }
-      return [];
-    })
-  );
-
-  const exportBindingsByLocalName = Object.fromEntries(
-    Array.from(hoistedExportNames).map(localName => [localName, `__tla_export_${localName}`])
-  );
-
-  const exportBindings = Object.fromEntries(
-    Object.entries(exportMap).map(([exportName, localName]) => [
-      exportName,
-      exportBindingsByLocalName[localName] ?? localName
-    ])
-  );
-
-  const exportedBindingNameSet = new Set(Object.values(exportBindings));
-  const exportedBindingNames = Array.from(exportedBindingNameSet);
-
-  const importedNames = new Set(
-    imports.flatMap(importStmt => importStmt.specifiers.map(specifier => specifier.local.value))
-  );
-  const exportFromedNames = new Set(
-    exportFroms.flatMap(exportStmt =>
-      exportStmt.specifiers.map(specifier => {
-        if (specifier.type === "ExportNamespaceSpecifier") {
-          return specifier.name.value;
-        } else if (specifier.type === "ExportDefaultSpecifier") {
-          // When will this happen?
-          return specifier.exported.value;
+      case "ExportDefaultDeclaration": {
+        const decl = stmt.declaration;
+        if (decl.type === "FunctionDeclaration" || decl.type === "ClassDeclaration") {
+          if (decl.id) {
+            exportMap["default"] = decl.id.name;
+            hoistedExportNames.add(decl.id.name);
+            // Remove "export default "
+            s.remove(start, decl.start!);
+            bodyStmts.push({ node: decl, start: decl.start!, end });
+          } else {
+            const name = `__tla_default_${defaultCounter++}`;
+            exportMap["default"] = name;
+            // Replace "export default function/class" with "let __name = function/class"
+            s.overwrite(start, (decl as any).start!, `let ${name} = `);
+            bodyStmts.push({ node: stmt, start, end });
+          }
         } else {
-          return (specifier.exported || specifier.orig).value;
+          // export default <expression>
+          const name = `__tla_default_${defaultCounter++}`;
+          exportMap["default"] = name;
+          s.overwrite(start, (decl as any).start!, `let ${name} = `);
+          bodyStmts.push({ node: stmt, start, end });
         }
-      })
-    )
-  );
-  const exportedNamesDeclaration = makeVariablesDeclaration(
-    exportedBindingNames.filter(name => !importedNames.has(name) && !exportFromedNames.has(name))
-  );
-
-  const warppedStatements = topLevelStatements.flatMap<SWC.Statement>(stmt => {
-    if (stmt.type === "VariableDeclaration") {
-      const declaredNames = stmt.declarations.flatMap(decl => resolvePattern(decl.id));
-      const exportedDeclaredNames = declaredNames.filter(name => exportedNameSet.has(name));
-      const unexportedDeclaredNames = declaredNames.filter(name => !exportedNameSet.has(name));
-
-      // None is exported in the declared names, no need to transform
-      if (exportedDeclaredNames.length === 0) return stmt;
-
-      // Generate assignment statements for init-ed declarators
-      const assignmentStatements = stmt.declarations
-        .filter(decl => decl.init)
-        .map(decl => makeAssignmentStatement(decl.id, decl.init));
-
-      // Generate variable declarations for unexported variables
-      const unexportedDeclarations = makeVariablesDeclaration(unexportedDeclaredNames);
-
-      return unexportedDeclarations ? [unexportedDeclarations, ...assignmentStatements] : assignmentStatements;
-    } else if (stmt.type === "FunctionDeclaration" || stmt.type === "ClassDeclaration") {
-      const name = stmt.identifier.value;
-      if (!exportedNameSet.has(name)) return stmt;
-
-      const exportBindingName = exportBindingsByLocalName[name];
-      if (!exportBindingName) {
-        return makeAssignmentStatement(makeIdentifier(name), declarationToExpression(stmt));
+        break;
       }
 
-      return [stmt, makeAssignmentStatement(makeIdentifier(exportBindingName), makeIdentifier(name))];
-    } else {
-      return stmt;
+      default:
+        bodyStmts.push({ node: stmt, start, end });
+        break;
     }
-  });
+  }
 
-  /*
-   * Process dynamic imports.
-   *
-   * ```js
-   * [
-   *   import("some-module-with-tla"),
-   *   import("some-module-without-tla"),
-   *   import(dynamicModuleName)
-   * ]
-   * ```
-   *
-   * The expression evaluates to a promise, which will resolve after module loaded, but not after
-   * out `__tla` promise resolved.
-   *
-   * We can check the target module. If the argument is string literial and the target module has NO
-   * top-level await, we won't need to transform it.
-   *
-   * ```js
-   * [
-   *   import("some-module-with-tla").then(async m => { await m.__tla; return m; }),
-   *   import("some-module-without-tla"),
-   *   import(dynamicModuleName).then(async m => { await m.__tla; return m; })
-   * ]
-   * ```
-   */
+  // --- Phase 2: Build export bindings ---
+  const exportedLocalNames = new Set(Object.values(exportMap));
 
-  transformByType(warppedStatements, "CallExpression", (call: SWC.CallExpression) => {
-    if (call.callee.type === "Import") {
-      const argument = call.arguments[0].expression;
-      if (argument.type === "StringLiteral") {
-        const importedModuleName = resolveImport(moduleName, argument.value);
+  // For ALL exported function/class declarations, use __tla_export_X bindings
+  // to preserve hoisting behavior (both `export function f` and plain `function f` with `export { f }`)
+  const exportBindingsByLocal: Record<string, string> = {};
+  for (const { node } of bodyStmts) {
+    if (
+      (node.type === "FunctionDeclaration" || node.type === "ClassDeclaration") &&
+      node.id && exportedLocalNames.has(node.id.name)
+    ) {
+      exportBindingsByLocal[node.id.name] = `__tla_export_${node.id.name}`;
+    }
+  }
 
-        // Skip transform
-        if (importedModuleName && !bundleInfo[importedModuleName]?.transformNeeded) return call;
+  const exportBindings: Record<string, string> = {};
+  for (const [exportedName, localName] of Object.entries(exportMap)) {
+    exportBindings[exportedName] = exportBindingsByLocal[localName] ?? localName;
+  }
+
+  const exportedBindingNames = [...new Set(Object.values(exportBindings))];
+
+  // Names imported by import declarations (don't re-declare these)
+  const importedNames = new Set<string>();
+  for (const imp of imports) {
+    for (const spec of imp.specifiers) importedNames.add(spec.local.name);
+  }
+
+  // Names from export-from (don't re-declare)
+  const exportFromedNames = new Set<string>();
+  for (const ef of exportFroms) {
+    if (ef.type !== "ExportNamedDeclaration") continue;
+    for (const spec of ef.specifiers) {
+      if (spec.type === "ExportSpecifier") {
+        const name = spec.exported.type === "Identifier"
+          ? spec.exported.name : (spec.exported as any).value;
+        exportFromedNames.add(name);
+      } else if (spec.type === "ExportNamespaceSpecifier") {
+        const name = spec.exported.type === "Identifier"
+          ? spec.exported.name : (spec.exported as any).value;
+        exportFromedNames.add(name);
       }
-
-      return makeCallExpression(makeMemberExpression(call, "then"), [
-        makeArrowFunction(
-          ["m"],
-          [
-            makeStatement(makeAwaitExpression(makeMemberExpression("m", options.promiseExportName))),
-            makeReturnStatement(makeIdentifier("m"))
-          ],
-          true
-        )
-      ]);
     }
+  }
 
-    return call;
-  });
+  // Hoisted declarations: exported binding names that aren't already declared by imports/exportFroms
+  const hoistDeclNames = exportedBindingNames.filter(
+    n => !importedNames.has(n) && !exportFromedNames.has(n)
+  );
 
-  /*
-   * Import and await the promise "__tla" from each imported module with TLA transform enabled.
-   *
-   * ```js
-   * import { ..., __tla as __tla_0 } from "...";
-   * import { ..., __tla as __tla_1 } from "...";
-   * ```
-   *
-   * To work with circular dependency, wrap each imported promise with try-catch.
-   * Promises from circular dependencies will not be imported and awaited.
-   *
-   * ```js
-   * export let __tla = Promise.all([
-   *   (() => { try { return __tla_0; } catch {} })(),
-   *   (() => { try { return __tla_1; } catch {} })()
-   * ]).then(async () => {
-   *   // original top-level statements here
-   * });
-   * ```
-   */
+  // --- Phase 3: Transform body statements ---
+  for (const { node, start, end } of bodyStmts) {
+    if (node.type === "VariableDeclaration") {
+      transformVariableDecl(s, node, exportedLocalNames);
+    } else if (
+      (node.type === "FunctionDeclaration" || node.type === "ClassDeclaration") &&
+      node.id && exportedLocalNames.has(node.id.name)
+    ) {
+      const bindingName = exportBindingsByLocal[node.id.name];
+      if (bindingName) {
+        // Append assignment after declaration
+        s.appendLeft(end, `\n${bindingName} = ${node.id.name};`);
+      }
+    }
+  }
 
-  // Add import of TLA promises from imported modules
+  // --- Phase 4: Transform dynamic imports ---
+  transformDynamicImports(s, ast, chunkName, graph, options);
+
+  // --- Phase 5: Add TLA promise imports ---
   let importedPromiseCount = 0;
-  for (const declaration of [...imports, ...exportFroms]) {
-    const importedModuleName = resolveImport(moduleName, declaration.source.value);
-    if (!importedModuleName || !bundleInfo[importedModuleName]) continue;
 
-    if (bundleInfo[importedModuleName].transformNeeded) {
-      let targetImportDeclaration: SWC.ImportDeclaration;
-      if (declaration.type === "ImportDeclaration") {
-        targetImportDeclaration = declaration;
-      } else {
-        targetImportDeclaration = makeImportDeclaration(declaration.source);
-        newImportsByExportFroms.push(targetImportDeclaration);
-      }
-      targetImportDeclaration.specifiers.push(
-        makeImportSpecifier(options.promiseExportName, options.promiseImportName(importedPromiseCount))
-      );
-      importedPromiseCount++;
+  for (const imp of imports) {
+    const importedModule = resolveImport(chunkName, imp.source.value as string);
+    if (!importedModule || !graph[importedModule]?.transformNeeded) continue;
+
+    const alias = options.promiseImportName(importedPromiseCount);
+    const specStr = `${options.promiseExportName} as ${alias}`;
+
+    if (imp.specifiers.length > 0) {
+      const lastSpec = imp.specifiers[imp.specifiers.length - 1];
+      s.appendRight(lastSpec.end!, `, ${specStr}`);
+    } else {
+      // Side-effect import: import "./b" → import { __tla as __tla_0 } from "./b"
+      s.appendLeft((imp.source as any).start!, `{ ${specStr} } from `);
+    }
+    importedPromiseCount++;
+  }
+
+  for (const ef of exportFroms) {
+    const source = ef.source;
+    if (!source) continue;
+    const importedModule = resolveImport(chunkName, source.value as string);
+    if (!importedModule || !graph[importedModule]?.transformNeeded) continue;
+
+    const alias = options.promiseImportName(importedPromiseCount);
+    s.appendLeft(
+      ef.start!,
+      `import { ${options.promiseExportName} as ${alias} } from ${JSON.stringify(source.value)};\n`
+    );
+    importedPromiseCount++;
+  }
+
+  // --- Phase 6: Build IIFE wrapper ---
+  const promiseArrayStr = importedPromiseCount > 0
+    ? `Promise.all([${Array.from({ length: importedPromiseCount }, (_, i) =>
+        `(() => { try { return ${options.promiseImportName(i)}; } catch {} })()`
+      ).join(", ")}]).then(async () => {\n`
+    : `(async () => {\n`;
+
+  const promiseCloseStr = importedPromiseCount > 0 ? `\n})` : `\n})()`;
+
+  const hasImporters = graph[chunkName]?.importedBy?.length > 0;
+  const hasExports = Object.keys(exportMap).length > 0;
+  const needsExport = hasExports || hasImporters;
+
+  // Remove old named export declarations
+  for (const ne of namedExports) {
+    s.remove(ne.start!, ne.end!);
+  }
+
+  const hoistDeclStr = hoistDeclNames.length > 0 ? `let ${hoistDeclNames.join(", ")};\n` : "";
+
+  if (needsExport) {
+    exportBindings[options.promiseExportName] = options.promiseExportName;
+  }
+
+  const exportListStr = needsExport
+    ? `\nexport { ${Object.entries(exportBindings)
+        .map(([exp, loc]) => exp === loc ? exp : `${loc} as ${exp}`)
+        .join(", ")} };\n`
+    : "";
+
+  if (bodyStmts.length > 0) {
+    const firstStart = bodyStmts[0].start;
+    const lastEnd = bodyStmts[bodyStmts.length - 1].end;
+
+    if (needsExport) {
+      s.appendLeft(firstStart, `${hoistDeclStr}let ${options.promiseExportName} = ${promiseArrayStr}`);
+      s.appendRight(lastEnd, `${promiseCloseStr};${exportListStr}`);
+    } else {
+      s.appendLeft(firstStart, `${hoistDeclStr}${promiseArrayStr}`);
+      s.appendRight(lastEnd, `${promiseCloseStr};\n`);
+    }
+  } else {
+    // No body — still need to create the promise wrapper for awaiting dependencies
+    const insertPoint = namedExports.length > 0
+      ? namedExports[0].start!
+      : (ast.body.length > 0 ? ast.body[ast.body.length - 1].end! : 0);
+
+    if (needsExport) {
+      const wrapperStr = `${hoistDeclStr}let ${options.promiseExportName} = ${promiseArrayStr}${promiseCloseStr};${exportListStr}`;
+      s.appendRight(insertPoint, wrapperStr);
+    } else {
+      s.appendRight(insertPoint, `${hoistDeclStr}${promiseArrayStr}${promiseCloseStr};\n`);
     }
   }
 
-  const importedPromiseArray =
-    importedPromiseCount === 0
-      ? null
-      : makeArrayExpression(
-          [...Array(importedPromiseCount).keys()].map(i =>
-            makeCallExpression(
-              makeArrowFunction(
-                [],
-                [makeTryCatchStatement([makeReturnStatement(makeIdentifier(options.promiseImportName(i)))], [])]
-              )
-            )
-          )
-        );
+  return {
+    code: s.toString(),
+    map: s.generateMap({ hires: true })
+  };
+}
 
-  // The `async () => { /* original top-level statements */ }` function
-  const wrappedTopLevelFunction = makeArrowFunction([], warppedStatements, true);
+function transformVariableDecl(
+  s: MagicString,
+  stmt: VariableDeclaration,
+  exportedNames: Set<string>
+): void {
+  for (const decl of stmt.declarations) {
+    const names = resolvePatternNames(decl.id);
+    const exportedDeclNames = names.filter(n => exportedNames.has(n));
+    if (exportedDeclNames.length === 0) continue;
 
-  // `Promise.all([ /* ... */]).then(async () => { /* ... */ })` or `(async () => {})()`
-  const promiseExpression = importedPromiseArray
-    ? makeCallExpression(
-        makeMemberExpression(
-          makeCallExpression(makeMemberExpression("Promise", "all"), [importedPromiseArray]),
-          "then"
-        ),
-        [wrappedTopLevelFunction]
-      )
-    : makeCallExpression(wrappedTopLevelFunction);
+    const unexportedNames = names.filter(n => !exportedNames.has(n));
 
-  /*
-   * New top-level after transformation:
-   *
-   * import { ..., __tla as __tla_0 } from "some-module-with-TLA";
-   * import { ... } from "some-module-without-TLA";
-   *
-   * let some, variables, exported, from, original, top, level;
-   *
-   * let __tla = Promise.all([ ... ]).then(async () => {
-   *   ...
-   * });
-   *
-   * export { ..., __tla };
-   */
+    if (stmt.declarations.length === 1) {
+      // Single declarator — we can transform in place
+      // Remove "const/let/var " keyword
+      s.remove(stmt.start!, decl.id.start!);
 
-  const newTopLevel: SWC.ModuleItem[] = [
-    ...imports,
-    ...newImportsByExportFroms,
-    ...exportFroms,
-    exportedNamesDeclaration
-  ];
+      // Declare unexported names inside the IIFE (before this statement)
+      if (unexportedNames.length > 0) {
+        s.appendLeft(decl.id.start!, `let ${unexportedNames.join(", ")};\n`);
+      }
 
-  if (exportedNames.length > 0 || bundleInfo[moduleName]?.importedBy?.length > 0) {
-    // If the chunk is being imported, append export of the TLA promise to export list
-    const promiseDeclaration = makeVariableInitDeclaration(options.promiseExportName, promiseExpression);
-    exportBindings[options.promiseExportName] = options.promiseExportName;
-
-    newTopLevel.push(promiseDeclaration, makeExportListDeclaration(Object.entries(exportBindings)));
-  } else {
-    // If the chunk is an entry, just execute the promise expression
-    newTopLevel.push(makeStatement(promiseExpression));
+      // For ObjectPattern, wrap in parens to avoid ambiguity with block statements
+      // ArrayPattern doesn't need parens
+      if (decl.id.type === "ObjectPattern") {
+        s.appendLeft(decl.id.start!, "(");
+        const endChar = s.original[stmt.end! - 1];
+        if (endChar === ";") {
+          s.appendLeft(stmt.end! - 1, ")");
+        } else {
+          s.appendRight(stmt.end!, ")");
+        }
+      }
+    } else {
+      // Multiple declarators in same declaration — rare in Rollup output
+      // Remove the keyword, convert to individual assignments
+      s.remove(stmt.start!, stmt.declarations[0].id.start!);
+      if (unexportedNames.length > 0) {
+        s.appendLeft(stmt.declarations[0].id.start!, `let ${unexportedNames.join(", ")};\n`);
+      }
+    }
   }
+}
 
-  ast.body = newTopLevel.filter(x => x);
+function transformDynamicImports(
+  s: MagicString,
+  ast: Program,
+  chunkName: string,
+  graph: BundleGraph,
+  options: Required<Options>
+): void {
+  walkNode(ast, (node: any) => {
+    if (node.type === "ImportExpression") {
+      const arg = node.source;
+      if (arg.type === "Literal" && typeof arg.value === "string") {
+        const importedModule = resolveImport(chunkName, arg.value);
+        if (importedModule && !graph[importedModule]?.transformNeeded) return;
+      }
+      s.appendRight(
+        node.end!,
+        `.then(async m => { await m.${options.promiseExportName}; return m; })`
+      );
+    }
+  });
+}
 
-  return ast;
+function walkNode(node: any, visitor: (node: any) => void): void {
+  if (!node || typeof node !== "object") return;
+  if (Array.isArray(node)) {
+    for (const child of node) walkNode(child, visitor);
+    return;
+  }
+  if (node.type) visitor(node);
+  for (const key of Object.keys(node)) {
+    if (key === "type" || key === "start" || key === "end" || key === "loc" || key === "range") continue;
+    const child = node[key];
+    if (child && typeof child === "object") walkNode(child, visitor);
+  }
+}
+
+export function resolvePatternNames(pattern: Pattern): string[] {
+  switch (pattern.type) {
+    case "Identifier":
+      return [pattern.name];
+    case "ObjectPattern":
+      return pattern.properties.flatMap(prop => {
+        if (prop.type === "RestElement") return resolvePatternNames(prop.argument);
+        return resolvePatternNames(prop.value);
+      });
+    case "ArrayPattern":
+      return pattern.elements
+        .filter((elem): elem is Pattern => elem !== null)
+        .flatMap(elem => {
+          if (elem.type === "RestElement") return resolvePatternNames(elem.argument);
+          return resolvePatternNames(elem);
+        });
+    case "AssignmentPattern":
+      return resolvePatternNames(pattern.left);
+    default:
+      return [];
+  }
 }
