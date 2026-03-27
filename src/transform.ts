@@ -207,12 +207,19 @@ export function transformChunk(
     if (imp.specifiers.length > 0) {
       const lastSpec = imp.specifiers[imp.specifiers.length - 1];
       if (lastSpec.type === 'ImportSpecifier') {
-        // Already inside { }, can append named specifier directly
+        // Already inside { }, can append named specifier directly.
+        // e.g. `import { foo }` → `import { foo, __tla as __tla_0 }`
         s.appendRight(lastSpec.end!, `, ${specStr}`);
-      } else {
-        // Default or namespace specifier — must wrap in { } to produce valid ESM syntax
-        // e.g. `import foo from '...'` → `import foo, { __tla as __tla_0 } from '...'`
+      } else if (lastSpec.type === 'ImportDefaultSpecifier') {
+        // Default-only import — append a named imports group.
+        // e.g. `import foo` → `import foo, { __tla as __tla_0 }`
+        // (`import foo, * as ns` has a namespace specifier as its LAST specifier, not default)
         s.appendRight(lastSpec.end!, `, { ${specStr} }`);
+      } else {
+        // ImportNamespaceSpecifier — ESM does not allow mixing namespace + named imports
+        // in the same clause, so insert a separate import statement.
+        // e.g. `import * as ns from './b'` → keep as-is, prepend `import { __tla as __tla_0 } from './b'`
+        s.appendLeft(imp.start!, `import { ${specStr} } from ${JSON.stringify(imp.source.value)};\n`);
       }
     } else {
       // Side-effect import: import "./b" → import { __tla as __tla_0 } from "./b"
@@ -331,10 +338,25 @@ function transformVariableDecl(
       }
     } else {
       // Multiple declarators in same declaration — rare in Rollup output
+      // Only process on the first exported declarator to avoid duplicate s.remove() calls
+      const firstExportedIndex = stmt.declarations.findIndex(d =>
+        resolvePatternNames(d.id).some(n => exportedNames.has(n))
+      );
+      if (stmt.declarations.indexOf(decl) !== firstExportedIndex) continue;
+
       // Remove the keyword, convert to individual assignments
       s.remove(stmt.start!, stmt.declarations[0].id.start!);
-      if (unexportedNames.length > 0) {
-        s.appendLeft(stmt.declarations[0].id.start!, `let ${unexportedNames.join(", ")};\n`);
+
+      // Collect ALL non-exported names across ALL declarators in this statement.
+      // When 'var ' is removed, every declarator becomes a bare assignment. Exported
+      // names are already hoisted as 'let' outside the IIFE by hoistDeclStr. Non-exported
+      // names have no declaration at all in strict-mode ESM → ReferenceError, so we must
+      // declare them with 'let' here.
+      const allUnexportedInStmt = stmt.declarations.flatMap(d =>
+        resolvePatternNames(d.id).filter(n => !exportedNames.has(n))
+      );
+      if (allUnexportedInStmt.length > 0) {
+        s.appendLeft(stmt.declarations[0].id.start!, `let ${allUnexportedInStmt.join(", ")};\n`);
       }
     }
   }

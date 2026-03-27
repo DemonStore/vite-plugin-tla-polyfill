@@ -554,4 +554,116 @@ describe("transformChunk", () => {
     expect(() => parseCode(result.code)).not.toThrow();
     expect(result.code).toContain("(async () => {");
   });
+
+  // --- Regression: import specifier wrapping ---
+
+  it("should wrap __tla in braces when appending to a default import", () => {
+    // Bug: `import foo, __tla as __tla_0 from './b'` is invalid ESM syntax.
+    // Must produce: `import foo, { __tla as __tla_0 } from './b'`
+    const code = `import foo from "./b";\nawait globalThis.somePromise;\n`;
+    const graph: BundleGraph = {
+      a: { transformNeeded: true, tlaImports: ["b"], importedBy: [] },
+      b: { transformNeeded: true, tlaImports: [], importedBy: ["a"] }
+    };
+
+    const result = transformChunk(code, parseCode(code), "a", graph, DEFAULT_OPTIONS);
+
+    expect(() => parseCode(result.code)).not.toThrow();
+    expect(result.code).toContain(`import foo, { __tla as __tla_0 } from "./b"`);
+  });
+
+  it("should insert a separate import for namespace imports (ESM forbids namespace + named in one clause)", () => {
+    // `import * as ns, { foo } from './b'` is invalid ESM — namespace and named imports
+    // cannot coexist in the same import clause. Must produce a separate import statement.
+    const code = `import * as ns from "./b";\nawait globalThis.somePromise;\n`;
+    const graph: BundleGraph = {
+      a: { transformNeeded: true, tlaImports: ["b"], importedBy: [] },
+      b: { transformNeeded: true, tlaImports: [], importedBy: ["a"] }
+    };
+
+    const result = transformChunk(code, parseCode(code), "a", graph, DEFAULT_OPTIONS);
+
+    expect(() => parseCode(result.code)).not.toThrow();
+    // The namespace import must be left intact
+    expect(result.code).toContain(`import * as ns from "./b"`);
+    // __tla must be imported via a separate statement
+    expect(result.code).toContain(`import { __tla as __tla_0 } from "./b"`);
+  });
+
+  it("should insert a separate import for default + namespace import", () => {
+    // `import foo, * as ns` — last specifier is namespace, same constraint applies.
+    const code = `import foo, * as ns from "./b";\nawait globalThis.somePromise;\n`;
+    const graph: BundleGraph = {
+      a: { transformNeeded: true, tlaImports: ["b"], importedBy: [] },
+      b: { transformNeeded: true, tlaImports: [], importedBy: ["a"] }
+    };
+
+    const result = transformChunk(code, parseCode(code), "a", graph, DEFAULT_OPTIONS);
+
+    expect(() => parseCode(result.code)).not.toThrow();
+    expect(result.code).toContain(`import foo, * as ns from "./b"`);
+    expect(result.code).toContain(`import { __tla as __tla_0 } from "./b"`);
+  });
+
+  // --- Regression: multi-declarator var with mixed exported/non-exported names ---
+
+  it("should declare non-exported names with let when var is removed from multi-declarator statement", () => {
+    // Bug: `var exported = f(exported || {}), nonExported = g(nonExported || {})`
+    // When 'exported' is exported, plugin removes 'var ', but 'nonExported' loses its
+    // declaration entirely → ReferenceError in strict-mode ESM.
+    const code = [
+      `var Exported = ((t) => (t.A = "a", t))(Exported || {}), NonExported = ((t) => (t.B = "b", t))(NonExported || {});`,
+      `export { Exported };`
+    ].join("\n");
+    const graph: BundleGraph = {
+      m: { transformNeeded: true, tlaImports: [], importedBy: [] }
+    };
+
+    const result = transformChunk(code, parseCode(code), "m", graph, DEFAULT_OPTIONS);
+
+    expect(() => parseCode(result.code)).not.toThrow();
+    // NonExported must be declared with let inside the IIFE
+    expect(result.code).toContain("let NonExported");
+    // Exported is hoisted outside the IIFE
+    expect(result.code).toContain("let Exported");
+    // var keyword must be gone
+    expect(result.code).not.toContain("var Exported");
+  });
+
+  it("should not call s.remove twice when multiple declarators are exported in same var statement", () => {
+    // Bug: the loop called s.remove() on the same range once per exported declarator,
+    // causing a MagicString crash on the second call.
+    const code = [
+      `var A = ((t) => (t.X = "x", t))(A || {}), B = ((t) => (t.Y = "y", t))(B || {});`,
+      `export { A, B };`
+    ].join("\n");
+    const graph: BundleGraph = {
+      m: { transformNeeded: true, tlaImports: [], importedBy: [] }
+    };
+
+    // Must not throw (previously crashed with a MagicString split-range error)
+    expect(() => {
+      const result = transformChunk(code, parseCode(code), "m", graph, DEFAULT_OPTIONS);
+      parseCode(result.code);
+    }).not.toThrow();
+  });
+
+  it("should handle three-declarator var where only middle one is exported", () => {
+    const code = [
+      `var A = ((t) => (t.X = "x", t))(A || {}), B = ((t) => (t.Y = "y", t))(B || {}), C = ((t) => (t.Z = "z", t))(C || {});`,
+      `export { B };`
+    ].join("\n");
+    const graph: BundleGraph = {
+      m: { transformNeeded: true, tlaImports: [], importedBy: [] }
+    };
+
+    const result = transformChunk(code, parseCode(code), "m", graph, DEFAULT_OPTIONS);
+
+    expect(() => parseCode(result.code)).not.toThrow();
+    // A and C must be declared with let together (non-exported, lose var)
+    expect(result.code).toContain("let A, C");
+    // B is hoisted outside the IIFE
+    expect(result.code).toContain("let B");
+    expect(result.code).not.toContain("var ");
+  });
 });
