@@ -206,7 +206,14 @@ export function transformChunk(
 
     if (imp.specifiers.length > 0) {
       const lastSpec = imp.specifiers[imp.specifiers.length - 1];
-      s.appendRight(lastSpec.end!, `, ${specStr}`);
+      if (lastSpec.type === 'ImportSpecifier') {
+        // Already inside { }, can append named specifier directly
+        s.appendRight(lastSpec.end!, `, ${specStr}`);
+      } else {
+        // Default or namespace specifier — must wrap in { } to produce valid ESM syntax
+        // e.g. `import foo from '...'` → `import foo, { __tla as __tla_0 } from '...'`
+        s.appendRight(lastSpec.end!, `, { ${specStr} }`);
+      }
     } else {
       // Side-effect import: import "./b" → import { __tla as __tla_0 } from "./b"
       s.appendLeft((imp.source as any).start!, `{ ${specStr} } from `);
