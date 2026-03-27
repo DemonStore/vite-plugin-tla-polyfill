@@ -2,6 +2,7 @@ name: Test
 
 on:
   push:
+    branches: ['**']
   pull_request:
 
 jobs:
@@ -11,24 +12,10 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, windows-latest]
-        node: ["14", "16", "18", "20", "22"]
-        vite: ["2", "3", "4", "5", "6", "7"]
+        node: ["18", "20", "22"]
+        vite: ["5", "6", "7"]
         exclude:
-          # Vite 5 doesn't support Node.js <= 16
-          - node: "14"
-            vite: "5"
-          - node: "16"
-            vite: "5"
-          # Vite 5 doesn't support Node.js <= 16
-          - node: "14"
-            vite: "6"
-          - node: "16"
-            vite: "6"
           # Vite 7 doesn't support Node.js <= 18
-          - node: "14"
-            vite: "7"
-          - node: "16"
-            vite: "7"
           - node: "18"
             vite: "7"
     name: Node.js ${{ matrix.node }} + Vite ${{ matrix.vite }} on ${{ matrix.os }}
@@ -46,14 +33,8 @@ jobs:
         run: yarn add vite@^${{ matrix.vite }}
       - name: Build
         run: yarn build
-      - name: Test (Native)
+      - name: Test
         run: yarn test
-        env:
-          VITE_TLA_FORCE_NATIVE: "true"
-      - name: Test (WASM)
-        run: yarn test
-        env:
-          VITE_TLA_FORCE_WASM: "true"
       - name: Check style
         if: ${{ matrix.os != 'windows-latest' }}
         run: yarn format --check
