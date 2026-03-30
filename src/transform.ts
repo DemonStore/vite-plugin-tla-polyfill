@@ -175,8 +175,24 @@ export function transformChunk(
     n => !importedNames.has(n) && !exportFromedNames.has(n)
   );
 
+  // Compute the boundary position after which IIFE wrapping is safe.
+  // Plugins like @sentry/vite-plugin may inject an IIFE *before* the import
+  // declarations in a chunk (e.g. for debug-id injection).  If we blindly use
+  // bodyStmts[0].start as the IIFE insertion point we'd wrap the import
+  // declarations inside the async function — which is invalid ESM.
+  // Solution: only wrap body statements whose source position is *after* every
+  // static import / export-from statement in the chunk.
+  const importBoundary = Math.max(
+    0,
+    ...imports.map(imp => imp.end as number),
+    ...exportFroms.map(ef => ef.end as number)
+  );
+  // Body statements that live before (or straddle) the import boundary stay at
+  // the module top level — they are NOT wrapped in the async IIFE.
+  const iifeBodyStmts = bodyStmts.filter(s => s.start >= importBoundary);
+
   // --- Phase 3: Transform body statements ---
-  for (const { node, start, end } of bodyStmts) {
+  for (const { node, start, end } of iifeBodyStmts) {
     if (node.type === "VariableDeclaration") {
       transformVariableDecl(s, node, exportedLocalNames);
     } else if (
@@ -272,9 +288,9 @@ export function transformChunk(
         .join(", ")} };\n`
     : "";
 
-  if (bodyStmts.length > 0) {
-    const firstStart = bodyStmts[0].start;
-    const lastEnd = bodyStmts[bodyStmts.length - 1].end;
+  if (iifeBodyStmts.length > 0) {
+    const firstStart = iifeBodyStmts[0].start;
+    const lastEnd = iifeBodyStmts[iifeBodyStmts.length - 1].end;
 
     if (needsExport) {
       s.appendLeft(firstStart, `${hoistDeclStr}let ${options.promiseExportName} = ${promiseArrayStr}`);
@@ -284,10 +300,13 @@ export function transformChunk(
       s.appendRight(lastEnd, `${promiseCloseStr};\n`);
     }
   } else {
-    // No body — still need to create the promise wrapper for awaiting dependencies
+    // No wrappable body statements — insert the promise wrapper after all imports
+    // (or after the last named-export / last statement as a fallback).
     const insertPoint = namedExports.length > 0
       ? namedExports[0].start!
-      : (ast.body.length > 0 ? ast.body[ast.body.length - 1].end! : 0);
+      : importBoundary > 0
+        ? importBoundary
+        : (ast.body.length > 0 ? ast.body[ast.body.length - 1].end! : 0);
 
     if (needsExport) {
       const wrapperStr = `${hoistDeclStr}let ${options.promiseExportName} = ${promiseArrayStr}${promiseCloseStr};${exportListStr}`;

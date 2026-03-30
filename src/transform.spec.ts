@@ -530,6 +530,73 @@ describe("transformChunk", () => {
     expect(result.code).toContain("export {");
   });
 
+  // --- Regression: pre-import body statements (e.g. Sentry debug-id IIFE) ---
+
+  it("should not wrap import declarations inside IIFE when a plugin injects code before imports", () => {
+    // @sentry/vite-plugin (and similar tools) prepend a synchronous IIFE to chunks
+    // BEFORE the static import declarations.  Previously the IIFE insertion point
+    // was bodyStmts[0].start = 0, so imports at positions > 0 ended up inside the
+    // async wrapper — producing invalid ESM ("import" declarations inside a function).
+    const sentryIife = `!function(){try{var e=globalThis;e._sentryDebugIds=e._sentryDebugIds||{},e._sentryDebugIds["stack"]="test-debug-id"}catch(e){}}();`;
+    const code = [
+      sentryIife,
+      `import { foo } from "./b";`,
+      `import "./c";`,
+      `const result = foo + 1;`,
+      `export { result };`
+    ].join("\n");
+
+    const graph: BundleGraph = {
+      a: { transformNeeded: true, tlaImports: ["b", "c"], importedBy: [] },
+      b: { transformNeeded: true, tlaImports: [], importedBy: ["a"] },
+      c: { transformNeeded: true, tlaImports: [], importedBy: ["a"] }
+    };
+
+    const result = transformChunk(code, parseCode(code), "a", graph, DEFAULT_OPTIONS);
+
+    // Must be parseable — import declarations must NOT be inside the async function
+    expect(() => parseCode(result.code)).not.toThrow();
+
+    // The Sentry IIFE must be present and at the top level (not moved or removed)
+    expect(result.code).toContain("_sentryDebugIds");
+
+    // Both imports must have __tla specifiers added
+    expect(result.code).toContain("__tla as __tla_0");
+    expect(result.code).toContain("__tla as __tla_1");
+
+    // The async IIFE wrapper must wrap only the body (not the imports)
+    expect(result.code).toContain("Promise.all(");
+
+    // Sanity: result and __tla are exported
+    expect(result.code).toContain("let result;");
+    expect(result.code).toContain("export {");
+    expect(result.code).toContain("__tla");
+  });
+
+  it("should keep pre-import IIFE outside the async wrapper when there are no TLA imports", () => {
+    // Same scenario but the imported modules don't need TLA transform.
+    // The chunk itself has TLA; the pre-import IIFE must still stay outside.
+    const sentryIife = `!function(){try{globalThis.__dbg="id"}catch(e){}}();`;
+    const code = [
+      sentryIife,
+      `import { helper } from "./utils";`,
+      `const data = await fetch("/api");`,
+      `export { data };`
+    ].join("\n");
+
+    const graph: BundleGraph = {
+      a: { transformNeeded: true, tlaImports: [], importedBy: [] },
+      utils: { transformNeeded: false, tlaImports: [], importedBy: ["a"] }
+    };
+
+    const result = transformChunk(code, parseCode(code), "a", graph, DEFAULT_OPTIONS);
+
+    expect(() => parseCode(result.code)).not.toThrow();
+    expect(result.code).toContain("__dbg");
+    expect(result.code).toContain("await fetch");
+    expect(result.code).toContain("let data;");
+  });
+
   it("gracefully handles missing chunk in graph", () => {
     const code = `await globalThis.someFunc(import("./unknown.js"));\n`;
     const graph: BundleGraph = {};
