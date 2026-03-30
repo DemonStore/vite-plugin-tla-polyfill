@@ -77,4 +77,74 @@ describe("detect", () => {
     const result = detect(parseCode(`for (const x of [1, 2, 3]) {}`));
     expect(result.hasTLA).toBe(false);
   });
+
+  it("should not detect for-await inside async function as TLA", () => {
+    const result = detect(parseCode(`async function f() { for await (const x of gen()) {} }`));
+    expect(result.hasTLA).toBe(false);
+  });
+
+  it("should detect await in try/catch at top level", () => {
+    const result = detect(parseCode(`
+      try { await something; } catch (e) { console.error(e); }
+    `));
+    expect(result.hasTLA).toBe(true);
+  });
+
+  it("should detect await in finally at top level", () => {
+    const result = detect(parseCode(`
+      try { doStuff(); } finally { await cleanup(); }
+    `));
+    expect(result.hasTLA).toBe(true);
+  });
+
+  it("should detect await in switch/case at top level", () => {
+    const result = detect(parseCode(`
+      switch (mode) {
+        case "a": await initA(); break;
+        case "b": await initB(); break;
+      }
+    `));
+    expect(result.hasTLA).toBe(true);
+  });
+
+  it("should detect dynamic import inside a function", () => {
+    const result = detect(parseCode(`function load() { return import("./lazy"); }`));
+    expect(result.hasDynamicImport).toBe(true);
+    expect(result.hasTLA).toBe(false);
+  });
+
+  it("should detect dynamic import with template literal", () => {
+    const result = detect(parseCode("const m = import(`./modules/${name}`)"));
+    expect(result.hasDynamicImport).toBe(true);
+  });
+
+  it("should handle multiple TLA expressions in one module", () => {
+    const result = detect(parseCode(`
+      const a = await fetch("/a");
+      const b = await fetch("/b");
+      for await (const item of stream) {}
+    `));
+    expect(result.hasTLA).toBe(true);
+    expect(result.hasDynamicImport).toBe(false);
+  });
+
+  it("should not detect await in nested async-in-sync-in-module", () => {
+    const result = detect(parseCode(`
+      function outer() {
+        async function inner() { await something; }
+        return inner();
+      }
+    `));
+    expect(result.hasTLA).toBe(false);
+  });
+
+  it("should not detect await in getter/setter", () => {
+    const result = detect(parseCode(`
+      const obj = {
+        get value() { return 1; },
+        set value(v) { /* no await possible here */ }
+      };
+    `));
+    expect(result.hasTLA).toBe(false);
+  });
 });

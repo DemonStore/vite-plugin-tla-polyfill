@@ -96,6 +96,60 @@ describe("buildBundleGraph", () => {
     expect(graph["a.js"].tlaImports).toEqual([]);
   });
 
+  it("should handle diamond dependency (A→B, A→C, B→D, C→D where D has TLA)", () => {
+    const analysis = new Map<string, ChunkAnalysis>();
+    analysis.set("a.js", makeAnalysis(false));
+    analysis.set("b.js", makeAnalysis(false));
+    analysis.set("c.js", makeAnalysis(false));
+    analysis.set("d.js", makeAnalysis(true));
+
+    const chunks: Record<string, RenderedChunk> = {
+      "a.js": makeChunk(["b.js", "c.js"]),
+      "b.js": makeChunk(["d.js"]),
+      "c.js": makeChunk(["d.js"]),
+      "d.js": makeChunk([])
+    };
+
+    const graph = buildBundleGraph(analysis, chunks);
+    expect(graph["d.js"].transformNeeded).toBe(true);
+    expect(graph["b.js"].transformNeeded).toBe(true);
+    expect(graph["c.js"].transformNeeded).toBe(true);
+    expect(graph["a.js"].transformNeeded).toBe(true);
+    expect(graph["a.js"].tlaImports).toEqual(["b.js", "c.js"]);
+    expect(graph["b.js"].tlaImports).toEqual(["d.js"]);
+    expect(graph["c.js"].tlaImports).toEqual(["d.js"]);
+  });
+
+  it("should handle circular dependency (A↔B)", () => {
+    const analysis = new Map<string, ChunkAnalysis>();
+    analysis.set("a.js", makeAnalysis(true));
+    analysis.set("b.js", makeAnalysis(false));
+
+    const chunks: Record<string, RenderedChunk> = {
+      "a.js": makeChunk(["b.js"]),
+      "b.js": makeChunk(["a.js"])
+    };
+
+    const graph = buildBundleGraph(analysis, chunks);
+    expect(graph["a.js"].transformNeeded).toBe(true);
+    expect(graph["b.js"].transformNeeded).toBe(true);
+    expect(graph["a.js"].tlaImports).toEqual(["b.js"]);
+    expect(graph["b.js"].tlaImports).toEqual(["a.js"]);
+  });
+
+  it("should handle self-import (chunk imports itself)", () => {
+    const analysis = new Map<string, ChunkAnalysis>();
+    analysis.set("a.js", makeAnalysis(true));
+
+    const chunks: Record<string, RenderedChunk> = {
+      "a.js": makeChunk(["a.js"])
+    };
+
+    const graph = buildBundleGraph(analysis, chunks);
+    expect(graph["a.js"].transformNeeded).toBe(true);
+    expect(graph["a.js"].tlaImports).toEqual(["a.js"]);
+  });
+
   it("should mark dynamic import chunks as needing transform", () => {
     const analysis = new Map<string, ChunkAnalysis>();
     analysis.set("a.js", makeAnalysis(false, true));

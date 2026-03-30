@@ -16,22 +16,6 @@ function normalize(code: string): string {
   return code.replace(/\s+/g, " ").trim();
 }
 
-function testTransform(
-  chunkName: string,
-  graph: BundleGraph,
-  code: string,
-  expectedSubstrings: string[]
-): string {
-  const ast = parseCode(code);
-  const result = transformChunk(code, ast, chunkName, graph, DEFAULT_OPTIONS);
-
-  for (const substr of expectedSubstrings) {
-    expect(normalize(result.code)).toContain(normalize(substr));
-  }
-
-  return result.code;
-}
-
 describe("transformChunk", () => {
   it("should wrap TLA in async IIFE for module without imports/exports", () => {
     const code = `await globalThis.somePromise;`;
@@ -646,6 +630,280 @@ describe("transformChunk", () => {
       const result = transformChunk(code, parseCode(code), "m", graph, DEFAULT_OPTIONS);
       parseCode(result.code);
     }).not.toThrow();
+  });
+
+  // --- Propagated transform (no local TLA, imports TLA module) ---
+
+  it("should transform module with no local TLA that imports a TLA module", () => {
+    const code = [
+      `import { value } from "./b";`,
+      `const doubled = value * 2;`,
+      `export { doubled };`
+    ].join("\n");
+
+    const graph: BundleGraph = {
+      a: { transformNeeded: true, tlaImports: ["b"], importedBy: [] },
+      b: { transformNeeded: true, tlaImports: [], importedBy: ["a"] }
+    };
+
+    const result = transformChunk(code, parseCode(code), "a", graph, DEFAULT_OPTIONS);
+    expect(() => parseCode(result.code)).not.toThrow();
+    expect(result.code).toContain("__tla as __tla_0");
+    expect(result.code).toContain("Promise.all(");
+    expect(result.code).toContain("let doubled;");
+    expect(result.code).toContain("export {");
+  });
+
+  it("should transform module with both local TLA and TLA imports", () => {
+    const code = [
+      `import { dep } from "./b";`,
+      `const x = await fetch("/api");`,
+      `const y = dep + x;`,
+      `export { y };`
+    ].join("\n");
+
+    const graph: BundleGraph = {
+      a: { transformNeeded: true, tlaImports: ["b"], importedBy: [] },
+      b: { transformNeeded: true, tlaImports: [], importedBy: ["a"] }
+    };
+
+    const result = transformChunk(code, parseCode(code), "a", graph, DEFAULT_OPTIONS);
+    expect(() => parseCode(result.code)).not.toThrow();
+    expect(result.code).toContain("__tla as __tla_0");
+    expect(result.code).toContain("Promise.all(");
+    expect(result.code).toContain("await fetch");
+    expect(result.code).toContain("let y;");
+  });
+
+  // --- Import specifier combinations ---
+
+  it("should append __tla to default + named import", () => {
+    const code = `import foo, { bar } from "./b";\nawait globalThis.somePromise;\n`;
+    const graph: BundleGraph = {
+      a: { transformNeeded: true, tlaImports: ["b"], importedBy: [] },
+      b: { transformNeeded: true, tlaImports: [], importedBy: ["a"] }
+    };
+
+    const result = transformChunk(code, parseCode(code), "a", graph, DEFAULT_OPTIONS);
+    expect(() => parseCode(result.code)).not.toThrow();
+    // Last specifier is ImportSpecifier(bar), so __tla appends inside existing braces
+    expect(result.code).toContain("import foo, { bar, __tla as __tla_0 } from");
+  });
+
+  it("should append __tla to multiple named imports", () => {
+    const code = `import { a, b, c } from "./b";\nawait globalThis.somePromise;\n`;
+    const graph: BundleGraph = {
+      a: { transformNeeded: true, tlaImports: ["b"], importedBy: [] },
+      b: { transformNeeded: true, tlaImports: [], importedBy: ["a"] }
+    };
+
+    const result = transformChunk(code, parseCode(code), "a", graph, DEFAULT_OPTIONS);
+    expect(() => parseCode(result.code)).not.toThrow();
+    expect(result.code).toContain("{ a, b, c, __tla as __tla_0 }");
+  });
+
+  // --- Export patterns ---
+
+  it("should handle export * from (re-export all without alias)", () => {
+    const code = [
+      `export * from "./b";`,
+      `const x = await globalThis.somePromise;`,
+      `export { x };`
+    ].join("\n");
+
+    const graph: BundleGraph = {
+      a: { transformNeeded: true, tlaImports: ["b"], importedBy: [] },
+      b: { transformNeeded: true, tlaImports: [], importedBy: ["a"] }
+    };
+
+    const result = transformChunk(code, parseCode(code), "a", graph, DEFAULT_OPTIONS);
+    expect(() => parseCode(result.code)).not.toThrow();
+    // export * should remain untouched
+    expect(result.code).toContain(`export * from "./b"`);
+    // Should add TLA import for it
+    expect(result.code).toContain("__tla as __tla_0");
+  });
+
+  it("should handle export default class without name", () => {
+    const code = [
+      `const a = await globalThis.somePromise;`,
+      `export default class { method() { return a; } }`
+    ].join("\n");
+
+    const graph: BundleGraph = {
+      a: { transformNeeded: true, tlaImports: [], importedBy: [] }
+    };
+
+    const result = transformChunk(code, parseCode(code), "a", graph, DEFAULT_OPTIONS);
+    expect(() => parseCode(result.code)).not.toThrow();
+    expect(result.code).toContain("__tla_default_");
+    expect(result.code).toContain("as default");
+    expect(result.code).not.toContain("export default");
+  });
+
+  it("should handle export let declaration", () => {
+    const code = [
+      `export let x = await globalThis.somePromise;`,
+      `export let y = 42;`
+    ].join("\n");
+
+    const graph: BundleGraph = {
+      m: { transformNeeded: true, tlaImports: [], importedBy: [] }
+    };
+
+    const result = transformChunk(code, parseCode(code), "m", graph, DEFAULT_OPTIONS);
+    expect(() => parseCode(result.code)).not.toThrow();
+    expect(result.code).not.toContain("export let");
+    expect(result.code).toContain("__tla");
+    expect(result.code).toMatch(/let\s+.*x/);
+    expect(result.code).toMatch(/let\s+.*y/);
+  });
+
+  it("should handle export var declaration (single declarator)", () => {
+    const code = [
+      `export var x = await globalThis.somePromise;`
+    ].join("\n");
+
+    const graph: BundleGraph = {
+      m: { transformNeeded: true, tlaImports: [], importedBy: [] }
+    };
+
+    const result = transformChunk(code, parseCode(code), "m", graph, DEFAULT_OPTIONS);
+    expect(() => parseCode(result.code)).not.toThrow();
+    expect(result.code).not.toContain("export var");
+    expect(result.code).toContain("__tla");
+  });
+
+  // --- Destructuring edge cases ---
+
+  it("should handle nested object destructuring with exports", () => {
+    const code = [
+      `const { a: { b, c }, d } = await globalThis.somePromise;`,
+      `export { b, d };`
+    ].join("\n");
+
+    const graph: BundleGraph = {
+      m: { transformNeeded: true, tlaImports: [], importedBy: [] }
+    };
+
+    const result = transformChunk(code, parseCode(code), "m", graph, DEFAULT_OPTIONS);
+    expect(() => parseCode(result.code)).not.toThrow();
+    expect(result.code).toContain("let b, d;");
+    // c is unexported, should be declared inside IIFE
+    expect(result.code).toContain("let c;");
+  });
+
+  it("should handle destructuring with default values and exports", () => {
+    const code = [
+      `const { a = 1, b = 2, c = 3 } = await globalThis.somePromise;`,
+      `export { a, c };`
+    ].join("\n");
+
+    const graph: BundleGraph = {
+      m: { transformNeeded: true, tlaImports: [], importedBy: [] }
+    };
+
+    const result = transformChunk(code, parseCode(code), "m", graph, DEFAULT_OPTIONS);
+    expect(() => parseCode(result.code)).not.toThrow();
+    expect(result.code).toContain("let a, c;");
+    expect(result.code).toContain("let b;");
+  });
+
+  it("should handle rest element in object destructuring with exports", () => {
+    const code = [
+      `const { a, ...rest } = await globalThis.somePromise;`,
+      `export { a, rest };`
+    ].join("\n");
+
+    const graph: BundleGraph = {
+      m: { transformNeeded: true, tlaImports: [], importedBy: [] }
+    };
+
+    const result = transformChunk(code, parseCode(code), "m", graph, DEFAULT_OPTIONS);
+    expect(() => parseCode(result.code)).not.toThrow();
+    expect(result.code).toContain("let a, rest;");
+  });
+
+  it("should handle rest element in array destructuring with exports", () => {
+    const code = [
+      `const [first, ...others] = await globalThis.somePromise;`,
+      `export { first };`
+    ].join("\n");
+
+    const graph: BundleGraph = {
+      m: { transformNeeded: true, tlaImports: [], importedBy: [] }
+    };
+
+    const result = transformChunk(code, parseCode(code), "m", graph, DEFAULT_OPTIONS);
+    expect(() => parseCode(result.code)).not.toThrow();
+    expect(result.code).toContain("let first;");
+    // others is not exported, declared inside IIFE
+    expect(result.code).toContain("let others;");
+  });
+
+  // --- Dynamic import edge cases ---
+
+  it("should wrap dynamic import inside a function body", () => {
+    const code = [
+      `function load(name) { return import("./" + name); }`,
+      `export { load };`
+    ].join("\n");
+
+    const graph: BundleGraph = {
+      a: { transformNeeded: true, tlaImports: [], importedBy: ["b"] }
+    };
+
+    const result = transformChunk(code, parseCode(code), "a", graph, DEFAULT_OPTIONS);
+    expect(() => parseCode(result.code)).not.toThrow();
+    // Dynamic import with non-literal arg should be wrapped
+    expect(result.code).toContain('.then(async m => { await m.__tla; return m; })');
+  });
+
+  // --- Multiple TLA imports from different sources ---
+
+  it("should handle three TLA imports with correct promise indices", () => {
+    const code = [
+      `import { a } from "./x";`,
+      `import { b } from "./y";`,
+      `import { c } from "./z";`,
+      `const result = await compute(a, b, c);`,
+      `export { result };`
+    ].join("\n");
+
+    const graph: BundleGraph = {
+      m: { transformNeeded: true, tlaImports: ["x", "y", "z"], importedBy: [] },
+      x: { transformNeeded: true, tlaImports: [], importedBy: ["m"] },
+      y: { transformNeeded: true, tlaImports: [], importedBy: ["m"] },
+      z: { transformNeeded: true, tlaImports: [], importedBy: ["m"] }
+    };
+
+    const result = transformChunk(code, parseCode(code), "m", graph, DEFAULT_OPTIONS);
+    expect(() => parseCode(result.code)).not.toThrow();
+    expect(result.code).toContain("__tla_0");
+    expect(result.code).toContain("__tla_1");
+    expect(result.code).toContain("__tla_2");
+    expect(result.code).toContain("Promise.all(");
+  });
+
+  // --- Only re-exports, no body, no TLA ---
+
+  it("should handle pure re-export module that needs transform due to propagation", () => {
+    const code = [
+      `import { foo } from "./b";`,
+      `export { foo };`
+    ].join("\n");
+
+    const graph: BundleGraph = {
+      a: { transformNeeded: true, tlaImports: ["b"], importedBy: ["c"] },
+      b: { transformNeeded: true, tlaImports: [], importedBy: ["a"] }
+    };
+
+    const result = transformChunk(code, parseCode(code), "a", graph, DEFAULT_OPTIONS);
+    expect(() => parseCode(result.code)).not.toThrow();
+    expect(result.code).toContain("__tla as __tla_0");
+    expect(result.code).toContain("Promise.all(");
+    expect(result.code).toContain("export {");
+    expect(result.code).toContain("__tla");
   });
 
   it("should handle three-declarator var where only middle one is exported", () => {
