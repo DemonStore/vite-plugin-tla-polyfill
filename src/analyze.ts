@@ -33,8 +33,9 @@ export function buildBundleGraph(
     .filter(([, info]) => info.transformNeeded)
     .map(([name]) => name);
 
-  while (queue.length > 0) {
-    const current = queue.shift()!;
+  let head = 0;
+  while (head < queue.length) {
+    const current = queue[head++];
     for (const importer of graph[current].importedBy) {
       if (!graph[importer].transformNeeded) {
         graph[importer].transformNeeded = true;

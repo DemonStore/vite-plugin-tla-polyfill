@@ -1,5 +1,4 @@
-import type { Node, Program } from "estree";
-import { simple } from "acorn-walk";
+import type { Program } from "estree";
 
 export interface DetectResult {
   hasTLA: boolean;
@@ -7,77 +6,61 @@ export interface DetectResult {
 }
 
 export function detect(ast: Program): DetectResult {
-  let hasTLA = false;
-  let hasDynamicImport = false;
-
-  // Track nesting depth: functions/classes/methods increase depth,
-  // only level-0 awaits are top-level
-  let depth = 0;
-
-  simple(ast as Node, {
-    Function(node: any) {
-      // acorn-walk's simple() does NOT descend into children automatically
-      // for explicitly handled node types, but it DOES for functions
-      // when we use "Function" as the catch-all.
-      // We need ancestor-aware walking instead.
-    },
-    ImportExpression() {
-      hasDynamicImport = true;
-    }
-  });
-
-  // For TLA detection we need depth tracking, use manual recursive walk
-  hasTLA = hasTLAWalk(ast);
-
-  return { hasTLA, hasDynamicImport };
+  return detectWalk(ast, 0, { hasTLA: false, hasDynamicImport: false });
 }
 
-function hasTLAWalk(node: any, depth: number = 0): boolean {
-  if (!node || typeof node !== "object") return false;
+function detectWalk(node: any, depth: number, result: DetectResult): DetectResult {
+  if (!node || typeof node !== "object") return result;
 
   if (Array.isArray(node)) {
-    return node.some(child => hasTLAWalk(child, depth));
+    for (const child of node) detectWalk(child, depth, result);
+    return result;
   }
 
   switch (node.type) {
     case "AwaitExpression":
-      if (depth === 0) return true;
-      return hasTLAWalk(node.argument, depth);
+      if (depth === 0) result.hasTLA = true;
+      detectWalk(node.argument, depth, result);
+      break;
 
     case "ForOfStatement":
-      if (node.await && depth === 0) return true;
-      return hasTLAWalk(node.left, depth) || hasTLAWalk(node.right, depth) || hasTLAWalk(node.body, depth);
+      if (node.await && depth === 0) result.hasTLA = true;
+      detectWalk(node.left, depth, result);
+      detectWalk(node.right, depth, result);
+      detectWalk(node.body, depth, result);
+      break;
 
     // These create new scope — increase depth
     case "FunctionDeclaration":
     case "FunctionExpression":
     case "ArrowFunctionExpression":
-      return hasTLAWalk(node.body, depth + 1);
+      detectWalk(node.body, depth + 1, result);
+      break;
 
     case "ClassDeclaration":
     case "ClassExpression":
-      return hasTLAWalk(node.body, depth + 1);
+      detectWalk(node.body, depth + 1, result);
+      break;
 
     case "MethodDefinition":
     case "PropertyDefinition":
     case "Property":
-      if (node.value) return hasTLAWalk(node.value, depth);
-      return false;
+      if (node.value) detectWalk(node.value, depth, result);
+      break;
 
-    // Don't descend into ImportExpression — not relevant for TLA
     case "ImportExpression":
-      return false;
+      result.hasDynamicImport = true;
+      break;
 
     default: {
-      // Recurse into all child nodes
       for (const key of Object.keys(node)) {
         if (key === "type" || key === "start" || key === "end" || key === "loc" || key === "range") continue;
         const child = node[key];
-        if (child && typeof child === "object") {
-          if (hasTLAWalk(child, depth)) return true;
-        }
+        if (child && typeof child === "object") detectWalk(child, depth, result);
       }
-      return false;
+      break;
     }
   }
+
+  return result;
 }
